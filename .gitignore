@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+server/tokens/
+server/data/cache/
+server/data/thumbs/
+
+# MicroPython
+firmware/config.py
+firmware/hello.py
+firmware/lib/
+
+# Arduino / PlatformIO
+firmware/arduino/.pio/
+firmware/arduino/src/secrets.h
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
