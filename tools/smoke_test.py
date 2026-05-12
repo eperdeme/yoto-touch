@@ -9,7 +9,7 @@ Walks the full happy path:
     5. (interactive) play a chosen card, then /now-playing, then /stop
 
 Run the server in another terminal first:
-    cd server && uvicorn app.main:app --port 8000
+    cd server && uvicorn app.main:app --port 8010
 
 Then:
     python tools/smoke_test.py
@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import json
 
-BASE = "http://localhost:8000"
+BASE = "http://localhost:8010"
 
 
 def _req(method: str, path: str) -> dict:

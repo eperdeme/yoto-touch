@@ -54,3 +54,9 @@
 #define PIN_TOUCH_RST  -1
 #define GT911_ADDR1    0x5D
 #define GT911_ADDR2    0x14
+
+// ----- SD card (SPI, shared bus on the Elecrow CrowPanel 7" HMI) -----
+#define PIN_SD_CS     10
+#define PIN_SD_MOSI   11
+#define PIN_SD_SCK    12
+#define PIN_SD_MISO   13

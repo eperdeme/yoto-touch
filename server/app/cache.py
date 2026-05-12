@@ -9,8 +9,23 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import re
 import time
 from typing import Any
+
+_NOTE_RE = re.compile(r"^\s*(.*?)(?:\s*#\s*(\d+))?\s*$")
+
+
+def parse_series_note(note: str | None) -> tuple[str | None, int | None]:
+    """Parse Yoto `metadata.note` like 'Cross Bones #1' into (series, seq)."""
+    if not note:
+        return None, None
+    m = _NOTE_RE.match(note)
+    if not m:
+        return None, None
+    name = (m.group(1) or "").strip()
+    seq = m.group(2)
+    return (name or None), (int(seq) if seq else None)
 
 import httpx
 from PIL import Image
@@ -19,7 +34,7 @@ from .config import settings
 from .yoto import yoto
 
 LIBRARY_TTL = 300  # seconds
-THUMB_SIZE = 160
+THUMB_SIZE = 144
 
 
 class LibraryCache:
@@ -57,6 +72,15 @@ class LibraryCache:
     def _normalise(card: dict[str, Any]) -> dict[str, Any]:
         meta = card.get("metadata") or {}
         cover = (meta.get("cover") or {}).get("imageL") or (meta.get("cover") or {}).get("imageS")
+        series, seq = parse_series_note(meta.get("note"))
+        if series is None:
+            series = (meta.get("series") or "").strip() or None
+        if seq is None:
+            raw_seq = meta.get("sequence_number") or card.get("book_number") or card.get("order")
+            try:
+                seq = int(raw_seq) if raw_seq is not None and str(raw_seq).strip() != "" else None
+            except (TypeError, ValueError):
+                seq = None
         return {
             "cardId": card.get("cardId"),
             "title": card.get("title") or meta.get("title") or "Untitled",
@@ -64,6 +88,8 @@ class LibraryCache:
             "category": meta.get("category"),
             "duration": meta.get("duration"),
             "cover_url": cover,
+            "series": series,
+            "sequence_number": seq,
             "raw": card,  # kept for /cards/{id}/full
         }
 
@@ -77,17 +103,167 @@ class LibraryCache:
 library = LibraryCache()
 
 
+# ---------- series detection ----------
+
+_STOPWORDS = {"the", "a", "an", "and", "of", "to", "in", "on", "for", "by", "with"}
+
+
+def _tokens(title: str) -> list[str]:
+    out: list[str] = []
+    word = []
+    for ch in title:
+        if ch.isalnum():
+            word.append(ch.lower())
+        else:
+            if word:
+                out.append("".join(word))
+                word = []
+    if word:
+        out.append("".join(word))
+    return out
+
+
+def _series_key(prefix: list[str]) -> str:
+    # Title-case for display; preserve original word boundaries.
+    return " ".join(w.capitalize() for w in prefix)
+
+
+def normalise_series_name(name: str) -> str:
+    """Normalise a series name for comparison/grouping (per Yoto convention).
+
+    Strip leading articles, drop non-alphanumerics, collapse whitespace, lowercase.
+    """
+    if not name:
+        return ""
+    s = name.strip().lower()
+    for art in ("the ", "a ", "an "):
+        if s.startswith(art):
+            s = s[len(art):]
+            break
+    out = []
+    prev_space = False
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+            prev_space = False
+        elif ch.isspace() or ch in "-_":
+            if not prev_space:
+                out.append(" ")
+                prev_space = True
+    return "".join(out).strip()
+
+
+def derive_series(cards: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Group card IDs by series name.
+
+    Prefers explicit metadata.series (Yoto API) when present; falls back to a
+    title-prefix heuristic for cards whose metadata is unset. Heuristic groups
+    are skipped if their normalised name collides with a real metadata series.
+    """
+    series: dict[str, list[str]] = {}
+    claimed: set[str] = set()  # cardIds already placed via metadata
+    norm_taken: set[str] = set()  # normalised names taken by metadata series
+
+    # 1) Explicit metadata.series, sorted by sequence_number then title.
+    by_meta: dict[str, list[dict[str, Any]]] = {}
+    for c in cards:
+        name = (c.get("series") or "").strip()
+        if not name:
+            continue
+        by_meta.setdefault(name, []).append(c)
+    for name, group in by_meta.items():
+        group.sort(key=lambda c: (
+            c.get("sequence_number") if c.get("sequence_number") is not None else 1_000_000,
+            (c.get("title") or "").lower(),
+        ))
+        series[name] = [c["cardId"] for c in group if c.get("cardId")]
+        claimed.update(series[name])
+        norm_taken.add(normalise_series_name(name))
+
+    # 2) Heuristic over remaining cards only.
+    by_author: dict[str, list[dict[str, Any]]] = {}
+    for c in cards:
+        if c.get("cardId") in claimed:
+            continue
+        a = c.get("author") or ""
+        by_author.setdefault(a, []).append(c)
+
+    for author, group in by_author.items():
+        if len(group) < 2:
+            continue
+        # Build (tokens, card) pairs with leading stopwords stripped.
+        pairs: list[tuple[list[str], dict[str, Any]]] = []
+        for c in group:
+            toks = _tokens(c.get("title") or "")
+            while toks and toks[0] in _STOPWORDS:
+                toks.pop(0)
+            if toks:
+                pairs.append((toks, c))
+
+        # Try prefix lengths from longest down; collect groups of size >= 2.
+        used: set[str] = set()
+        max_len = max((len(p[0]) for p in pairs), default=0)
+        for plen in range(min(max_len, 4), 0, -1):
+            buckets: dict[tuple[str, ...], list[str]] = {}
+            for toks, c in pairs:
+                if c["cardId"] in used or len(toks) < plen:
+                    continue
+                key = tuple(toks[:plen])
+                buckets.setdefault(key, []).append(c["cardId"])
+            for key, ids in buckets.items():
+                if len(ids) < 2:
+                    continue
+                # Skip purely-stopword or single-letter prefixes.
+                if all(len(w) <= 2 for w in key):
+                    continue
+                name = _series_key(list(key))
+                if author and author.lower() not in name.lower():
+                    name = f"{name} ({author})"
+                # Avoid clobbering an existing better (longer) series with the same name,
+                # or one already provided by real metadata.
+                if name in series or normalise_series_name(name) in norm_taken:
+                    continue
+                series[name] = ids
+                used.update(ids)
+    return series
+
+
+async def prewarm_thumbs(concurrency: int = 4) -> None:
+    """Fetch & convert every card thumbnail to .jpg + .565 in the background.
+
+    Idempotent: skips cards whose .565 file already exists.
+    """
+    cards = await library.cards()
+    sem = asyncio.Semaphore(concurrency)
+    pending = [
+        c for c in cards
+        if c.get("cardId") and not (settings.thumbs_dir / f"{c['cardId']}.{THUMB_SIZE}.565").exists()
+    ]
+    if not pending:
+        print(f"[prewarm] all {len(cards)} thumbs already cached")
+        return
+    print(f"[prewarm] warming {len(pending)}/{len(cards)} thumbnails...")
+
+    async def _one(cid: str) -> None:
+        async with sem:
+            await get_thumb_path(cid, "565")
+
+    t0 = time.time()
+    await asyncio.gather(*(_one(c["cardId"]) for c in pending), return_exceptions=True)
+    print(f"[prewarm] done in {time.time() - t0:.1f}s")
+
+
 # ---------- thumbnails ----------
 
 _thumb_lock = asyncio.Lock()
 
 
 async def get_thumb_path(card_id: str, fmt: str = "jpg") -> str | None:
-    """Return path to a 200x200 thumbnail (JPEG or RGB565), downloading + resizing if needed."""
+    """Return path to a thumbnail (JPEG or raw RGB565), downloading + resizing if needed."""
     if fmt == "565":
-        out = settings.thumbs_dir / f"{card_id}.565"
+        out = settings.thumbs_dir / f"{card_id}.{THUMB_SIZE}.565"
     else:
-        out = settings.thumbs_dir / f"{card_id}.jpg"
+        out = settings.thumbs_dir / f"{card_id}.{THUMB_SIZE}.jpg"
 
     if out.exists():
         return str(out)
@@ -102,15 +278,17 @@ async def get_thumb_path(card_id: str, fmt: str = "jpg") -> str | None:
                 return str(out)
             try:
                 img = Image.open(jpg_path).convert("RGB")
-                data = bytearray()
-                for y in range(THUMB_SIZE):
-                    for x in range(THUMB_SIZE):
-                        r, g, b = img.getpixel((x, y))
-                        # RGB565 Little Endian: (G[2:0] | B[4:0]), (R[4:0] | G[5:3])
-                        val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-                        data.append(val & 0xFF)
-                        data.append((val >> 8) & 0xFF)
-                out.write_bytes(data)
+                raw = img.tobytes()  # tightly-packed RGB bytes
+                buf = bytearray(THUMB_SIZE * THUMB_SIZE * 2)
+                for i in range(THUMB_SIZE * THUMB_SIZE):
+                    r = raw[i * 3]
+                    g = raw[i * 3 + 1]
+                    b = raw[i * 3 + 2]
+                    # RGB565 little-endian (low byte first)
+                    val = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                    buf[i * 2] = val & 0xFF
+                    buf[i * 2 + 1] = (val >> 8) & 0xFF
+                out.write_bytes(buf)
                 return str(out)
             except Exception:
                 return None

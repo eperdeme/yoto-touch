@@ -66,15 +66,15 @@ import one and you're done in seconds.)
    python -m venv .venv && source .venv/bin/activate
    pip install -e .
    cp .env.example .env       # paste your YOTO_CLIENT_ID
-   uvicorn app.main:app --host 0.0.0.0 --port 8000
+   uvicorn app.main:app --host 0.0.0.0 --port 8010
    ```
 3. First run only — sign in:
    ```bash
-   curl http://localhost:8000/auth/start
+   curl http://localhost:8010/auth/start
    # → { "user_code": "ZDTT-NSTF",
    #     "verification_uri_complete": "https://login.yotoplay.com/activate?user_code=ZDTT-NSTF", ... }
    # open that URL on your phone and confirm.
-   curl http://localhost:8000/auth/poll      # repeat until {"status":"authorized"}
+   curl http://localhost:8010/auth/poll      # repeat until {"status":"authorized"}
    ```
    Tokens are saved to `server/tokens/tokens.json` and refreshed automatically
    forever after.
@@ -142,7 +142,7 @@ commercial-card auto-discovery.
 
 - Tokens live on the companion server only. The ESP32 never sees Yoto creds.
 - The companion server has **no authentication** in front of it. Don't expose
-  port 8000 to the public internet — keep it on your home LAN. If you must
+  port 8010 to the public internet — keep it on your home LAN. If you must
   expose it, put it behind a reverse proxy with basic auth or a Tailscale /
   WireGuard tunnel.
 - Don't commit `.env`, `server/tokens/`, or `firmware/config.py`.

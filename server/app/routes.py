@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 import httpx
 
 from .auth import auth, AuthError
-from .cache import favourites, folders, get_thumb_path, library
+from .cache import favourites, folders, get_thumb_path, library, prewarm_thumbs, derive_series
 from .config import settings
 from .yoto import yoto
 
@@ -49,9 +49,12 @@ async def auth_status():
 @router.get("/cards")
 async def list_cards(
     page: int = Query(0, ge=0),
-    size: int = Query(24, ge=1, le=100),
+    size: int = Query(24, ge=1, le=200),
     favourites_only: bool = False,
     folder: str | None = None,
+    author: str | None = None,
+    series: str | None = None,
+    sort: str = Query("title"),
     refresh: bool = False,
 ):
     cards = await library.cards(force=refresh)
@@ -61,10 +64,76 @@ async def list_cards(
     if folder:
         ids = set(folders.cards_in(folder))
         cards = [c for c in cards if c["cardId"] in ids]
+    if author:
+        cards = [c for c in cards if (c.get("author") or "") == author]
+    if series:
+        ids = set(derive_series(await library.cards()).get(series, []))
+        cards = [c for c in cards if c["cardId"] in ids]
+    if sort == "author":
+        cards = sorted(cards, key=lambda c: ((c.get("author") or "~").lower(), (c.get("title") or "").lower()))
+    elif sort == "title_desc":
+        cards = sorted(cards, key=lambda c: (c.get("title") or "").lower(), reverse=True)
+    elif sort == "duration":
+        cards = sorted(cards, key=lambda c: c.get("duration") or 0, reverse=True)
+    else:  # title (default)
+        cards = sorted(cards, key=lambda c: (c.get("title") or "").lower())
     total = len(cards)
     start = page * size
     page_items = [_strip(c) for c in cards[start : start + size]]
     return {"total": total, "page": page, "size": size, "cards": page_items}
+
+
+@router.get("/authors")
+async def list_authors():
+    """Distinct authors with card counts, most common first."""
+    from collections import Counter
+    cards = await library.cards()
+    cnt: Counter[str] = Counter((c.get("author") or "(Unknown)") for c in cards)
+    items = [{"name": n, "count": k} for n, k in cnt.most_common()]
+    return {"authors": items, "total": len(cards)}
+
+
+@router.get("/series")
+async def list_series(expand: bool = False):
+    """Auto-detected series (common title prefix per author), most cards first.
+
+    With ?expand=true, each series includes its card list so the firmware can
+    render a series-browser in a single round-trip.
+    """
+    cards = await library.cards()
+    s = derive_series(cards)
+    by_id = {c["cardId"]: c for c in cards}
+    items: list[dict[str, Any]] = []
+    for name, ids in s.items():
+        entry: dict[str, Any] = {"name": name, "count": len(ids)}
+        if expand:
+            entry["cards"] = [
+                {
+                    "cardId": cid,
+                    "title": by_id[cid]["title"],
+                    "sequence_number": by_id[cid].get("sequence_number"),
+                }
+                for cid in ids
+                if cid in by_id
+            ]
+            # Preserve metadata-driven order (sequence_number) when present;
+            # fall back to alphabetical for heuristic series.
+            entry["cards"].sort(key=lambda c: (
+                c.get("sequence_number") if c.get("sequence_number") is not None else 1_000_000,
+                (c["title"] or "").lower(),
+            ))
+        items.append(entry)
+    items.sort(key=lambda x: (-x["count"], x["name"].lower()))
+    return {"series": items, "total": len(cards)}
+
+
+@router.post("/refresh")
+async def refresh_library():
+    """Force re-fetch from Yoto API and warm any new thumbnails."""
+    import asyncio
+    cards = await library.cards(force=True)
+    asyncio.create_task(prewarm_thumbs())
+    return {"ok": True, "total": len(cards)}
 
 
 def _strip(card: dict[str, Any]) -> dict[str, Any]:
@@ -74,8 +143,32 @@ def _strip(card: dict[str, Any]) -> dict[str, Any]:
         "author": card.get("author"),
         "category": card.get("category"),
         "duration": card.get("duration"),
+        "series": card.get("series"),
+        "sequence_number": card.get("sequence_number"),
         "thumb": f"/thumb/{card['cardId']}",
         "is_fav": favourites.is_fav(card["cardId"]),
+    }
+
+
+def _detail_extras(card: dict[str, Any], full: dict[str, Any]) -> dict[str, Any]:
+    """Extract rich detail fields from a Yoto card payload."""
+    raw = card.get("raw") or {}
+    meta = raw.get("metadata") or full.get("metadata") or {}
+    content = full.get("content") or raw.get("content") or {}
+    chapters = content.get("chapters") or []
+    media = (content.get("media") or {}) if isinstance(content, dict) else {}
+    track_count = sum(len(ch.get("tracks") or []) for ch in chapters)
+    return {
+        "description": (meta.get("description") or "").strip() or None,
+        "chapter_count": len(chapters),
+        "track_count": track_count,
+        "genre": meta.get("genre") or meta.get("genres"),
+        "age_min": meta.get("minAge") or meta.get("ageMin"),
+        "age_max": meta.get("maxAge") or meta.get("ageMax"),
+        "languages": meta.get("languages"),
+        "narrator": meta.get("narrator") or meta.get("readBy"),
+        "publisher": meta.get("publisher"),
+        "file_size": media.get("fileSize") if isinstance(media, dict) else None,
     }
 
 
@@ -86,7 +179,20 @@ async def card_detail(card_id: str):
     if not summary:
         raise HTTPException(404, "card not found")
     full = await yoto.get_card(card_id)
-    return {**_strip(summary), "chapters": full.get("content", {}).get("chapters", [])}
+    chapters = (full.get("content") or {}).get("chapters", [])
+    return {
+        **_strip(summary),
+        **_detail_extras(summary, full),
+        "chapters": [
+            {
+                "key": ch.get("key"),
+                "title": ch.get("title") or ch.get("name"),
+                "duration": ch.get("duration"),
+                "track_count": len(ch.get("tracks") or []),
+            }
+            for ch in chapters
+        ],
+    }
 
 
 @router.get("/thumb/{card_id}")
@@ -105,6 +211,57 @@ async def thumb565(card_id: str):
     if not path:
         raise HTTPException(404, "no thumbnail")
     return FileResponse(path, media_type="application/octet-stream")
+
+
+@router.get("/page565")
+async def page565(
+    page: int = Query(0, ge=0),
+    size: int = Query(8, ge=1, le=16),
+    author: str | None = None,
+    series: str | None = None,
+    sort: str = Query("title"),
+):
+    """Return all RGB565 thumbnails for a page concatenated as one binary blob.
+
+    Output: `size × THUMB_SIZE²×2` bytes. Missing/failing thumbnails are filled
+    with 0xFF so the firmware doesn't have to do bounds-checking. Card order
+    matches `/cards?page=...&size=...&author=...&sort=...`.
+    """
+    from fastapi.responses import Response
+    from .cache import THUMB_SIZE
+    THUMB_BYTES = THUMB_SIZE * THUMB_SIZE * 2
+
+    cards = await library.cards()
+    if author:
+        cards = [c for c in cards if (c.get("author") or "") == author]
+    if series:
+        ids = set(derive_series(await library.cards()).get(series, []))
+        cards = [c for c in cards if c["cardId"] in ids]
+    if sort == "author":
+        cards = sorted(cards, key=lambda c: ((c.get("author") or "~").lower(), (c.get("title") or "").lower()))
+    elif sort == "title_desc":
+        cards = sorted(cards, key=lambda c: (c.get("title") or "").lower(), reverse=True)
+    elif sort == "duration":
+        cards = sorted(cards, key=lambda c: c.get("duration") or 0, reverse=True)
+    else:
+        cards = sorted(cards, key=lambda c: (c.get("title") or "").lower())
+    start = page * size
+    page_cards = cards[start : start + size]
+
+    out = bytearray()
+    for c in page_cards:
+        path = await get_thumb_path(c["cardId"], "565")
+        if path:
+            try:
+                blob = open(path, "rb").read()
+                if len(blob) == THUMB_BYTES:
+                    out.extend(blob)
+                    continue
+            except Exception:
+                pass
+        out.extend(b"\xff" * THUMB_BYTES)
+
+    return Response(content=bytes(out), media_type="application/octet-stream")
 
 
 # ---------- favourites & folders ----------
@@ -156,10 +313,10 @@ async def list_devices():
 async def now_playing(device_id: str | None = None):
     did = device_id or await _resolve_device()
     try:
-        return await yoto.device_status(did)
+        data = await yoto.device_status(did)
+        data["available"] = True
+        return data
     except httpx.HTTPStatusError as e:
-        # Yoto requires `family:device-status:view`, which isn't always granted
-        # to public clients. Degrade gracefully so the UI keeps working.
         if e.response.status_code == 403:
             return {"deviceId": did, "available": False, "reason": "scope_missing"}
         raise
