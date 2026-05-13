@@ -14,6 +14,15 @@
 struct CardMeta {
     String id;
     String title;
+    String author;
+    String coverUrl;   // Yoto CDN cover URL
+    String description;
+    String category;
+    String language;
+    String shareType;
+    String series;
+    int sequenceNumber = -1;
+    int duration = 0;
 };
 
 namespace sdcache {
@@ -25,6 +34,12 @@ bool ready();                                              // returns last mount
 bool loadCover(const String &id, uint8_t *buf, size_t buf_bytes);
 bool saveCover(const String &id, const uint8_t *buf, size_t buf_bytes);
 bool hasCover(const String &id);
+
+// Rich card detail JSON sidecars from /card/family/library.
+bool loadDetailJson(const String &id, String &outJson);
+bool saveDetailJson(const String &id, const char *json, size_t len);
+bool loadDetailsSignature(String &outSignature);
+bool saveDetailsSignature(const String &signature);
 
 // Manifest (full card list for the current filter signature).
 bool saveManifest(const String &signature, const std::vector<CardMeta> &cards);

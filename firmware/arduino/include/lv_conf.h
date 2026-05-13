@@ -15,7 +15,7 @@
 #define LV_USE_STDLIB_SPRINTF LV_STDLIB_CLIB
 
 /* HAL SETTINGS */
-#define LV_DEF_REFR_PERIOD  16      /* ms (~60 FPS) */
+#define LV_DEF_REFR_PERIOD  33      /* ms (~30 FPS) */
 #define LV_DPI_DEF          130     /* Approximate for 7" 800x480 */
 
 /* FEATURE USAGE */
@@ -49,3 +49,7 @@
 #define LV_USE_THEME_DEFAULT 1
 #define LV_THEME_DEFAULT_DARK 1
 #define LV_THEME_DEFAULT_GROW 1
+
+/* LIBS */
+#define LV_USE_QRCODE 1
+#define LV_USE_LODEPNG 1

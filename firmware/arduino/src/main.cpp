@@ -2,12 +2,14 @@
 //
 // V2: Modern UI with Card Covers (160x160 RGB565).
 //   - Uses 4x2 grid for better visibility.
-//   - Fetches raw images from server to avoid JPEG overhead.
+//   - Fetches Yoto CDN covers and decodes PNG thumbnails to RGB565.
 //   - Preserves ESP32-S3 RGB "direct mode" performance.
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
+#include <esp_heap_caps.h>
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <ElegantOTA.h>
@@ -15,21 +17,31 @@
 #include <Preferences.h>
 #include <vector>
 #include <unordered_map>
+#include <map>
+#include <algorithm>
 #include <set>
 #include <esp_timer.h>
+#include <esp_cache.h>
 
 #include <Arduino_GFX_Library.h>
-#include <TAMC_GT911.h>
 #include <lvgl.h>
+
+extern "C" void lv_image_cache_drop(const void *src);
 
 #include "pins.h"
 #include "secrets.h"
+#include "yoto_api.h"
+#include "sd_cache.h"
 
 // ---------- constants ----------
 static const int THUMB_SIZE = 144;
+static const int DETAIL_COVER_SIZE = 260;
+static const uint32_t DETAIL_COVER_TLS_MIN_INTERNAL = 90000;
 static const int GRID_COLS = 4;
 static const int GRID_ROWS = 2;
 static const int PAGE_SIZE = GRID_COLS * GRID_ROWS;
+
+SET_LOOP_TASK_STACK_SIZE(12288);
 
 // ---------- display ----------
 static Arduino_ESP32RGBPanel *bus = new Arduino_ESP32RGBPanel(
@@ -47,7 +59,92 @@ static Arduino_ESP32RGBPanel *bus = new Arduino_ESP32RGBPanel(
 static Arduino_RGB_Display *gfx = new Arduino_RGB_Display(LCD_W, LCD_H, bus);
 
 // ---------- touch ----------
-static TAMC_GT911 ts(PIN_TOUCH_SDA, PIN_TOUCH_SCL, (uint8_t)PIN_TOUCH_INT, (uint8_t)PIN_TOUCH_RST, LCD_W, LCD_H);
+static const uint16_t GT911_PRODUCT_ID_REG = 0x8140;
+static const uint16_t GT911_POINT_INFO_REG = 0x814E;
+static const uint16_t GT911_POINT_1_REG = 0x814F;
+
+static uint8_t touchAddr = GT911_ADDR1;
+static bool touchReady = false;
+
+struct TouchPoint {
+    uint16_t x;
+    uint16_t y;
+};
+
+static bool touchWriteReg(uint16_t reg, const uint8_t *data, size_t len) {
+    Wire.beginTransmission(touchAddr);
+    Wire.write((uint8_t)(reg >> 8));
+    Wire.write((uint8_t)(reg & 0xFF));
+    for (size_t i = 0; i < len; i++) Wire.write(data[i]);
+    return Wire.endTransmission() == 0;
+}
+
+static bool touchReadReg(uint16_t reg, uint8_t *buf, size_t len) {
+    Wire.beginTransmission(touchAddr);
+    Wire.write((uint8_t)(reg >> 8));
+    Wire.write((uint8_t)(reg & 0xFF));
+    if (Wire.endTransmission(false) != 0) return false;
+    size_t got = Wire.requestFrom((int)touchAddr, (int)len);
+    if (got != len) return false;
+    for (size_t i = 0; i < len; i++) buf[i] = Wire.read();
+    return true;
+}
+
+static bool touchProbe(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return Wire.endTransmission() == 0;
+}
+
+static void touchClearPointInfo() {
+    uint8_t zero = 0;
+    touchWriteReg(GT911_POINT_INFO_REG, &zero, 1);
+}
+
+static bool touchInit() {
+    if (touchProbe(GT911_ADDR1)) {
+        touchAddr = GT911_ADDR1;
+    } else if (touchProbe(GT911_ADDR2)) {
+        touchAddr = GT911_ADDR2;
+    } else {
+        Serial.println("[touch] GT911 not found");
+        return false;
+    }
+
+    char product[5] = {0};
+    if (touchReadReg(GT911_PRODUCT_ID_REG, (uint8_t *)product, 4)) {
+        Serial.printf("[touch] GT911 addr=0x%02X product=%s\n", touchAddr, product);
+    } else {
+        Serial.printf("[touch] GT911 addr=0x%02X\n", touchAddr);
+    }
+    touchClearPointInfo();
+    touchReady = true;
+    return true;
+}
+
+static bool touchReadPoint(TouchPoint &pt) {
+    if (!touchReady) return false;
+
+    uint8_t info = 0;
+    if (!touchReadReg(GT911_POINT_INFO_REG, &info, 1)) return false;
+
+    bool bufferReady = (info & 0x80) != 0;
+    uint8_t touches = info & 0x0F;
+    if (!bufferReady || touches == 0) {
+        if (bufferReady) touchClearPointInfo();
+        return false;
+    }
+
+    uint8_t data[7] = {0};
+    bool ok = touchReadReg(GT911_POINT_1_REG, data, sizeof(data));
+    touchClearPointInfo();
+    if (!ok) return false;
+
+    pt.x = (uint16_t)data[1] | ((uint16_t)data[2] << 8);
+    pt.y = (uint16_t)data[3] | ((uint16_t)data[4] << 8);
+    if (pt.x >= LCD_W) pt.x = LCD_W - 1;
+    if (pt.y >= LCD_H) pt.y = LCD_H - 1;
+    return true;
+}
 
 // ---------- LVGL v9 plumbing ----------
 // DIRECT render into the panel framebuffer. The RGB peripheral runs a bounce-
@@ -89,8 +186,8 @@ static void wakeScreen() {
 }
 
 static void touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
-    ts.read();
-    if (ts.isTouched && ts.touches > 0) {
+    TouchPoint pt = {};
+    if (touchReadPoint(pt)) {
         // Any touch wakes the screen but is consumed (not passed to LVGL) if
         // the display was off, so kids can't accidentally trigger a button
         // when waking it up from a dark idle screen.
@@ -101,8 +198,8 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
         }
         wakeScreen();
         data->state = LV_INDEV_STATE_PRESSED;
-        data->point.x = ts.points[0].x;
-        data->point.y = ts.points[0].y;
+        data->point.x = pt.x;
+        data->point.y = pt.y;
     } else {
         data->state = LV_INDEV_STATE_RELEASED;
     }
@@ -110,78 +207,30 @@ static void touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
 
 // ---------- HTTP helpers ----------
 
-// Filter / sort state — declared early so the net task and pageQuerySuffix can read them.
+// Filter / sort state — declared early so the net task and UI can read them.
 String currentAuthor = "";       // empty = all authors
 String currentSeries = "";       // empty = no series filter
 String currentSort = "title";    // title | title_desc | author
-
-static String urlEncode(const String &s) {
-    String out;
-    out.reserve(s.length() * 3);
-    static const char *hex = "0123456789ABCDEF";
-    for (size_t i = 0; i < s.length(); i++) {
-        uint8_t c = (uint8_t)s[i];
-        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            c == '-' || c == '_' || c == '.' || c == '~') {
-            out += (char)c;
-        } else {
-            out += '%';
-            out += hex[c >> 4];
-            out += hex[c & 0xF];
-        }
-    }
-    return out;
-}
-
-static String pageQuerySuffix() {
-    String s = String("&sort=") + currentSort;
-    if (currentAuthor.length()) s += String("&author=") + urlEncode(currentAuthor);
-    if (currentSeries.length()) s += String("&series=") + urlEncode(currentSeries);
-    return s;
-}
-
-static HTTPClient netHttp;
-static bool netHttpInit = false;
-
-static String httpGet(const String &path) {
-    if (!netHttpInit) {
-        netHttp.setReuse(true);
-        netHttp.setTimeout(10000);
-        netHttpInit = true;
-    }
-    String url = String(SERVER_BASE) + path;
-    netHttp.begin(url);
-    int code = netHttp.GET();
-    String body = (code > 0) ? netHttp.getString() : String("");
-    if (code != 200) {
-        Serial.printf("[http] GET %s -> %d\n", url.c_str(), code);
-    }
-    netHttp.end();
-    return body;
-}
-
-static int httpPost(const String &path) {
-    HTTPClient http;
-    String url = String(SERVER_BASE) + path;
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    int code = http.POST("");
-    Serial.printf("[http] POST %s -> %d\n", url.c_str(), code);
-    http.end();
-    return code;
-}
+String currentSource = "";      // empty | creative | purchased
 
 // ---------- Background network task ----------
 // All HTTP I/O runs here on core 0 so the LVGL UI loop on core 1 never blocks.
 // Communication is via a FreeRTOS queue (requests) and atomic flags (results).
 
 enum NetCmd : uint8_t {
-    NET_POST,              // fire-and-forget POST
-    NET_FETCH_MANIFEST,    // reload manifest with current filters
-    NET_FETCH_PAGE,        // fetch /page565 covers for a page
-    NET_FETCH_DETAIL,      // fetch /cards/{id} extras
-    NET_FETCH_FILTERS,     // fetch /authors + /series for filter modal
-    NET_FETCH_SERIES,      // fetch /series?expand=true for series browser
+    NET_PLAY,              // play a card by ID
+    NET_PAUSE,
+    NET_RESUME,
+    NET_STOP,
+    NET_VOLUME,            // intArg = volume 0-100
+    NET_FETCH_MANIFEST,    // reload library from Yoto API
+    NET_FETCH_PAGE,        // fetch covers for a page (download PNG + decode)
+    NET_FETCH_DETAIL,      // fetch card detail
+    NET_FETCH_DETAIL_COVER,// fetch one larger cover for the open detail card
+    NET_FETCH_FILTERS,     // compute authors + series from libraryCards (local)
+    NET_FETCH_SERIES,      // same as filters but expanded for series browser
+    NET_FILL_COVER,        // slowly fill SD cover cache; intArg = libraryCards index
+    NET_AUTH_POLL,          // poll device code flow
 };
 
 struct NetRequest {
@@ -190,24 +239,50 @@ struct NetRequest {
     char   strArg[128];   // URL path for POST, cardId for detail
 };
 
+struct AuthorInfo { String name; int count; };
+struct SeriesInfo { String name; int count; };
+struct SeriesDetail { 
+    String name; 
+    int count; 
+    struct Card { String id; String title; int sequenceNumber; };
+    std::vector<Card> cards;
+};
+
 // Result slots — written by net task, consumed by UI loop.
 static volatile bool netManifestReady = false;
-static String        netManifestBody;
+static volatile bool netManifestOk = false;
+static std::vector<CardMeta> netManifestCards;
 static SemaphoreHandle_t netManifestMtx;
 
 static volatile bool netDetailReady = false;
-static String        netDetailBody;
+static YotoCardDetail netDetailResult;
 static String        netDetailId;
 static SemaphoreHandle_t netDetailMtx;
 
+static volatile bool netDetailCoverReady = false;
+static volatile bool netDetailCoverOk = false;
+static String        netDetailCoverId;
+static uint8_t      *netDetailCoverPixels = nullptr;
+static SemaphoreHandle_t netDetailCoverMtx;
+
 static volatile bool netFiltersReady = false;
-static String        netAuthorsBody;
-static String        netSeriesBody;
+static std::vector<AuthorInfo> netAuthors;
+static std::vector<SeriesInfo> netSeries;
+static int netTotalCards = 0;
 static SemaphoreHandle_t netFiltersMtx;
 
 static volatile bool netSeriesBrowseReady = false;
-static String        netSeriesBrowseBody;
+static std::vector<SeriesDetail> netSeriesBrowse;
 static SemaphoreHandle_t netSeriesBrowseMtx;
+
+static volatile bool netCacheFillReady = false;
+static volatile int netCacheFillIndex = -1;
+static volatile bool netCacheFillSaved = false;
+
+// Auth result
+static volatile bool netAuthReady = false;
+static String        netAuthResult;     // "authorized", "pending", "expired", "error"
+static SemaphoreHandle_t netAuthMtx;
 
 // Page fetch results — covers go directly into coverCache (PSRAM),
 // then we set a flag so UI knows to refresh tiles.
@@ -220,62 +295,206 @@ static SemaphoreHandle_t coverCacheMtx = nullptr;  // protects coverCache across
 
 // Forward declaration — defined after CachedCover/coverCache declarations.
 static bool netFetchPageIntoCache(int page);
+static bool netFillOneCover(int index);
+static void setNowPlaying(const String &id, const String &title);
+static void playCardNow(const String &id);
+
+// Forward-declared; defined in UI state section.
+static std::vector<CardMeta> libraryCards;         // full synced library
+static std::vector<uint16_t> visibleCardIdx;        // current filtered/sorted view into libraryCards
+
+static const CardMeta &visibleCardAt(int pos) {
+    return libraryCards[visibleCardIdx[pos]];
+}
+
+static bool cardComesBeforeInSeries(const CardMeta &a, const CardMeta &b) {
+    const bool aNumbered = a.sequenceNumber > 0;
+    const bool bNumbered = b.sequenceNumber > 0;
+    if (aNumbered && bNumbered && a.sequenceNumber != b.sequenceNumber) return a.sequenceNumber < b.sequenceNumber;
+    if (aNumbered != bNumbered) return aNumbered;
+    if (a.title != b.title) return a.title < b.title;
+    return a.id < b.id;
+}
+
+static bool seriesCardComesBefore(const SeriesDetail::Card &a, const SeriesDetail::Card &b) {
+    const bool aNumbered = a.sequenceNumber > 0;
+    const bool bNumbered = b.sequenceNumber > 0;
+    if (aNumbered && bNumbered && a.sequenceNumber != b.sequenceNumber) return a.sequenceNumber < b.sequenceNumber;
+    if (aNumbered != bNumbered) return aNumbered;
+    if (a.title != b.title) return a.title < b.title;
+    return a.id < b.id;
+}
+
+// Build authors from the full library (runs on net task, no server needed).
+static std::vector<AuthorInfo> buildAuthorsList() {
+    std::map<String, int> counts;
+    for (const auto &c : libraryCards) {
+        String a = c.author.length() ? c.author : "(Unknown)";
+        counts[a]++;
+    }
+    std::vector<AuthorInfo> out;
+    for (const auto &p : counts) out.push_back({p.first, p.second});
+    return out;
+}
+
+// Build series from the full library (runs on net task, no server needed).
+static std::vector<SeriesDetail> buildSeriesList(bool expand) {
+    std::map<String, std::vector<int>> seriesMap;
+    for (int i = 0; i < (int)libraryCards.size(); i++) {
+        if (libraryCards[i].series.length()) {
+            seriesMap[libraryCards[i].series].push_back(i);
+        }
+    }
+    std::vector<SeriesDetail> out;
+    for (const auto &p : seriesMap) {
+        if (p.second.size() < 2) continue;
+        SeriesDetail s;
+        s.name = p.first;
+        s.count = (int)p.second.size();
+        if (expand) {
+            for (int idx : p.second) {
+                s.cards.push_back({libraryCards[idx].id, libraryCards[idx].title, libraryCards[idx].sequenceNumber});
+            }
+            std::sort(s.cards.begin(), s.cards.end(), seriesCardComesBefore);
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
+}
 
 static void netTaskFn(void *) {
     NetRequest req;
     for (;;) {
         if (xQueueReceive(netQueue, &req, portMAX_DELAY) != pdTRUE) continue;
+
+        // Auth commands work even without WiFi check (for polling)
+        if (req.cmd == NET_AUTH_POLL) {
+            String result = yotoPollDeviceFlow(String(req.strArg));
+            xSemaphoreTake(netAuthMtx, portMAX_DELAY);
+            netAuthResult = result;
+            netAuthReady = true;
+            xSemaphoreGive(netAuthMtx);
+            continue;
+        }
+
         if (WiFi.status() != WL_CONNECTED) continue;
 
         switch (req.cmd) {
-        case NET_POST: {
-            httpPost(String(req.strArg));
+        case NET_PLAY: {
+            yotoPlayCard(String(req.strArg));
             break;
         }
+        case NET_PAUSE: { yotoPause(); break; }
+        case NET_RESUME: { yotoResume(); break; }
+        case NET_STOP: { yotoStop(); break; }
+        case NET_VOLUME: { yotoSetVolume(req.intArg); break; }
         case NET_FETCH_MANIFEST: {
-            String url = String("/cards?page=0&size=200&sort=") + currentSort;
-            if (currentAuthor.length()) url += String("&author=") + urlEncode(currentAuthor);
-            if (currentSeries.length()) url += String("&series=") + urlEncode(currentSeries);
-            String body = httpGet(url);
+            // Fetch full library from Yoto API
+            std::vector<YotoCard> yCards;
+            std::vector<CardMeta> results;
+            bool ok = yotoFetchLibrary(yCards);
+            if (ok) {
+                for (const auto &yc : yCards) {
+                    results.push_back({yc.cardId, yc.title, yc.author, yc.coverUrl,
+                                       "", "", "", yc.shareType, yc.series,
+                                       yc.sequenceNumber, yc.duration});
+                }
+            }
             xSemaphoreTake(netManifestMtx, portMAX_DELAY);
-            netManifestBody = body;
+            netManifestCards = std::move(results);
+            netManifestOk = ok;
             netManifestReady = true;
             xSemaphoreGive(netManifestMtx);
+            Serial.printf("[net] manifest done, stack HWM=%u heap=%u internal=%u\n",
+                (unsigned)uxTaskGetStackHighWaterMark(nullptr),
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
             break;
         }
         case NET_FETCH_PAGE: {
+            Serial.printf("[net] fetch page %d, heap=%u internal=%u\n",
+                req.intArg, (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
             netFetchPageIntoCache(req.intArg);
             netPageNum = req.intArg;
             netPageReady = true;
             break;
         }
         case NET_FETCH_DETAIL: {
-            String body = httpGet(String("/cards/") + req.strArg);
-            xSemaphoreTake(netDetailMtx, portMAX_DELAY);
-            netDetailBody = body;
-            netDetailId = String(req.strArg);
-            netDetailReady = true;
-            xSemaphoreGive(netDetailMtx);
+            YotoCardDetail detail;
+            if (yotoFetchCardDetail(String(req.strArg), detail)) {
+                xSemaphoreTake(netDetailMtx, portMAX_DELAY);
+                netDetailResult = std::move(detail);
+                netDetailId = String(req.strArg);
+                netDetailReady = true;
+                xSemaphoreGive(netDetailMtx);
+            }
+            break;
+        }
+        case NET_FETCH_DETAIL_COVER: {
+            const String cardId(req.strArg);
+            String coverUrl;
+            for (const auto &card : libraryCards) {
+                if (card.id == cardId) {
+                    coverUrl = card.coverUrl;
+                    break;
+                }
+            }
+
+            uint8_t *pixels = nullptr;
+            uint32_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            bool ok = false;
+            if (coverUrl.length() && internalFree >= DETAIL_COVER_TLS_MIN_INTERNAL) {
+                ok = yotoDownloadCover(coverUrl, &pixels, DETAIL_COVER_SIZE);
+            } else {
+                Serial.printf("[cover] skip detail cover %s internal=%u\n",
+                    cardId.c_str(), (unsigned)internalFree);
+            }
+
+            xSemaphoreTake(netDetailCoverMtx, portMAX_DELAY);
+            if (netDetailCoverPixels) {
+                heap_caps_free(netDetailCoverPixels);
+                netDetailCoverPixels = nullptr;
+            }
+            netDetailCoverId = cardId;
+            netDetailCoverPixels = ok ? pixels : nullptr;
+            netDetailCoverOk = ok;
+            netDetailCoverReady = true;
+            xSemaphoreGive(netDetailCoverMtx);
+
+            if (!ok && pixels) heap_caps_free(pixels);
             break;
         }
         case NET_FETCH_FILTERS: {
-            String a = httpGet("/authors");
-            String s = httpGet("/series");
+            auto a = buildAuthorsList();
+            auto s_full = buildSeriesList(false);
+            std::vector<SeriesInfo> s;
+            for (const auto &sf : s_full) s.push_back({sf.name, sf.count});
+
             xSemaphoreTake(netFiltersMtx, portMAX_DELAY);
-            netAuthorsBody = a;
-            netSeriesBody = s;
+            netAuthors = std::move(a);
+            netSeries = std::move(s);
+            netTotalCards = (int)libraryCards.size();
             netFiltersReady = true;
             xSemaphoreGive(netFiltersMtx);
             break;
         }
         case NET_FETCH_SERIES: {
-            String body = httpGet("/series?expand=true");
+            auto res = buildSeriesList(true);
             xSemaphoreTake(netSeriesBrowseMtx, portMAX_DELAY);
-            netSeriesBrowseBody = body;
+            netSeriesBrowse = std::move(res);
             netSeriesBrowseReady = true;
             xSemaphoreGive(netSeriesBrowseMtx);
             break;
         }
+        case NET_FILL_COVER: {
+            bool saved = netFillOneCover(req.intArg);
+            netCacheFillIndex = req.intArg;
+            netCacheFillSaved = saved;
+            netCacheFillReady = true;
+            break;
+        }
+        default: break;
         }
     }
 }
@@ -283,17 +502,39 @@ static void netTaskFn(void *) {
 static void netInit() {
     netManifestMtx    = xSemaphoreCreateMutex();
     netDetailMtx      = xSemaphoreCreateMutex();
+    netDetailCoverMtx = xSemaphoreCreateMutex();
     netFiltersMtx     = xSemaphoreCreateMutex();
     netSeriesBrowseMtx = xSemaphoreCreateMutex();
+    netAuthMtx        = xSemaphoreCreateMutex();
     netQueue = xQueueCreate(8, sizeof(NetRequest));
     coverCacheMtx = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(netTaskFn, "net", 12288, nullptr, 2, &netTaskHandle, 0);
+    xTaskCreatePinnedToCore(netTaskFn, "net", 24576, nullptr, 2, &netTaskHandle, 0);
 }
 
 // Helpers to enqueue requests from UI thread (non-blocking).
-static void netPost(const char *path) {
-    NetRequest r; r.cmd = NET_POST; r.intArg = 0;
-    strlcpy(r.strArg, path, sizeof(r.strArg));
+static void netPlayCard(const char *cardId) {
+    NetRequest r; r.cmd = NET_PLAY; r.intArg = 0;
+    strlcpy(r.strArg, cardId, sizeof(r.strArg));
+    xQueueSend(netQueue, &r, 0);
+}
+
+static void netPause() {
+    NetRequest r; r.cmd = NET_PAUSE; r.intArg = 0; r.strArg[0] = 0;
+    xQueueSend(netQueue, &r, 0);
+}
+
+static void netResume() {
+    NetRequest r; r.cmd = NET_RESUME; r.intArg = 0; r.strArg[0] = 0;
+    xQueueSend(netQueue, &r, 0);
+}
+
+static void netStop() {
+    NetRequest r; r.cmd = NET_STOP; r.intArg = 0; r.strArg[0] = 0;
+    xQueueSend(netQueue, &r, 0);
+}
+
+static void netSetVolume(int vol) {
+    NetRequest r; r.cmd = NET_VOLUME; r.intArg = vol; r.strArg[0] = 0;
     xQueueSend(netQueue, &r, 0);
 }
 
@@ -307,8 +548,19 @@ static void netFetchPage(int page) {
     xQueueSend(netQueue, &r, 0);
 }
 
+static void netFillCover(int index) {
+    NetRequest r; r.cmd = NET_FILL_COVER; r.intArg = index; r.strArg[0] = 0;
+    xQueueSend(netQueue, &r, 0);
+}
+
 static void netFetchDetail(const char *cardId) {
     NetRequest r; r.cmd = NET_FETCH_DETAIL; r.intArg = 0;
+    strlcpy(r.strArg, cardId, sizeof(r.strArg));
+    xQueueSend(netQueue, &r, 0);
+}
+
+static void netFetchDetailCover(const char *cardId) {
+    NetRequest r; r.cmd = NET_FETCH_DETAIL_COVER; r.intArg = 0;
     strlcpy(r.strArg, cardId, sizeof(r.strArg));
     xQueueSend(netQueue, &r, 0);
 }
@@ -323,49 +575,19 @@ static void netFetchSeries() {
     xQueueSend(netQueue, &r, 0);
 }
 
-static HTTPClient imgHttp;
-static bool imgHttpInit = false;
-
-static bool fetchImage(const String &cardId, uint8_t *dest) {
-    if (!imgHttpInit) {
-        imgHttp.setReuse(true);
-        imgHttp.setTimeout(8000);
-        imgHttpInit = true;
-    }
-    String url = String(SERVER_BASE) + "/thumb565/" + cardId;
-    imgHttp.begin(url);
-    int code = imgHttp.GET();
-    if (code != 200) {
-        Serial.printf("[img] %s -> %d\n", cardId.c_str(), code);
-        imgHttp.end();
-        return false;
-    }
-    int len = imgHttp.getSize();
-    const int expected = THUMB_SIZE * THUMB_SIZE * 2;
-    if (len != expected) {
-        Serial.printf("[img] %s wrong len %d (expected %d)\n", cardId.c_str(), len, expected);
-        imgHttp.end();
-        return false;
-    }
-    WiFiClient *stream = imgHttp.getStreamPtr();
-    size_t got = stream->readBytes(dest, expected);
-    imgHttp.end();
-    if ((int)got != expected) {
-        Serial.printf("[img] %s short read %u\n", cardId.c_str(), (unsigned)got);
-        return false;
-    }
-    return true;
+static void netAuthPoll(const char *deviceCode) {
+    NetRequest r; r.cmd = NET_AUTH_POLL; r.intArg = 0;
+    strlcpy(r.strArg, deviceCode, sizeof(r.strArg));
+    xQueueSend(netQueue, &r, 0);
 }
 
 // ---------- UI State ----------
-#include "sd_cache.h"
 
 struct CachedCover {
+    uint8_t *alloc;
     uint8_t *data;
     lv_image_dsc_t dsc;
 };
-
-static std::vector<CardMeta> allCards;             // full manifest, fetched once at boot
 
 struct StringHash {
     size_t operator()(const String &s) const {
@@ -380,8 +602,11 @@ struct StringHash {
 static std::unordered_map<String, CachedCover *, StringHash> coverCache;
 
 static int currentPage = 0;
+static int restorePage = 0;
 static int pendingPage = -1;
 static bool loading = false;
+static bool cacheFillInFlight = false;
+static int cacheFillIndex = 0;
 
 // Visible-page state: one tile per slot.
 static lv_obj_t *slotImg[PAGE_SIZE] = {nullptr};
@@ -391,21 +616,82 @@ static lv_obj_t *grid = nullptr;
 static lv_obj_t *pageLabel = nullptr;
 static lv_obj_t *statusLabel = nullptr;
 static lv_obj_t *filterBtnLabel = nullptr;
+static lv_obj_t *creativeTopBtn = nullptr;
+static lv_obj_t *purchasedTopBtn = nullptr;
+static lv_obj_t *bootSplash = nullptr;
+static lv_obj_t *bootSplashLabel = nullptr;
 static lv_obj_t *prevBtn = nullptr;
 static lv_obj_t *nextBtn = nullptr;
 static lv_obj_t *nowPlayingBar = nullptr;
+static lv_obj_t *nowPlayingImg = nullptr;
 static lv_obj_t *nowPlayingLabel = nullptr;
+static String nowPlayingId = "";
+static String nowPlayingTitle = "";
 
 static WebServer otaServer(80);
 
 static const int THUMB_BYTES = THUMB_SIZE * THUMB_SIZE * 2;
-static int maxPageCount() { return max(1, (int)((allCards.size() + PAGE_SIZE - 1) / PAGE_SIZE)); }
+static const int DETAIL_COVER_BYTES = DETAIL_COVER_SIZE * DETAIL_COVER_SIZE * 2;
+static int maxPageCount() { return max(1, (int)((visibleCardIdx.size() + PAGE_SIZE - 1) / PAGE_SIZE)); }
+
+static uint8_t *allocAlignedPsram(size_t bytes, uint8_t **rawOut) {
+    uint8_t *raw = (uint8_t *)heap_caps_malloc(bytes + 63, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw) {
+        if (rawOut) *rawOut = nullptr;
+        return nullptr;
+    }
+    uintptr_t aligned = ((uintptr_t)raw + 63) & ~(uintptr_t)63;
+    if (rawOut) *rawOut = raw;
+    return (uint8_t *)aligned;
+}
+
+static void freeAlignedPsram(uint8_t *raw) {
+    if (raw) heap_caps_free(raw);
+}
+
+static bool isCreativeCard(const CardMeta &card) {
+    return card.shareType == "myo" || card.shareType.length() == 0;
+}
+
+static bool cardMatchesSource(const CardMeta &card) {
+    if (currentSource == "creative") return isCreativeCard(card);
+    if (currentSource == "purchased") return !isCreativeCard(card);
+    return true;
+}
+
+static void setBootSplashText(const char *text) {
+    if (bootSplashLabel) lv_label_set_text(bootSplashLabel, text ? text : "Waking up...");
+}
+
+static void hideBootSplash() {
+    if (!bootSplash) return;
+    lv_obj_delete_async(bootSplash);
+    bootSplash = nullptr;
+    bootSplashLabel = nullptr;
+}
+
+static void syncPixels(uint8_t *data, size_t bytes) {
+    if (!data) return;
+    esp_err_t err = esp_cache_msync(
+        data,
+        bytes,
+        ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+            ESP_CACHE_MSYNC_FLAG_TYPE_DATA);
+    if (err != ESP_OK) {
+        Serial.printf("[cover] cache sync failed: %d\n", (int)err);
+    }
+}
+
+static void syncCoverPixels(uint8_t *data) {
+    syncPixels(data, THUMB_BYTES);
+}
 
 static CachedCover *getOrAllocCover(const String &id) {
     auto it = coverCache.find(id);
     if (it != coverCache.end()) return it->second;
     CachedCover *cv = new CachedCover();
-    cv->data = (uint8_t *)ps_malloc(THUMB_BYTES);
+    cv->alloc = nullptr;
+    cv->data = allocAlignedPsram(THUMB_BYTES, &cv->alloc);
     if (!cv->data) { delete cv; return nullptr; }
     memset(&cv->dsc, 0, sizeof(cv->dsc));
     cv->dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
@@ -426,75 +712,132 @@ static CachedCover *getOrAllocCover(const String &id) {
 static bool tryLoadCoverFromSd(const String &id) {
     if (!sdcache::ready()) return false;
     if (!sdcache::hasCover(id)) return false;
+    xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
     CachedCover *cv = getOrAllocCover(id);
-    if (!cv || !cv->data) return false;
-    if (!sdcache::loadCover(id, cv->data, THUMB_BYTES)) {
-        // The file exists but was unreadable / wrong size. Drop the empty
-        // allocation so isCovered() returns false and HTTP will refill it.
-        coverCache.erase(id);
-        free(cv->data);
-        delete cv;
+    if (!cv || !cv->data) {
+        xSemaphoreGive(coverCacheMtx);
         return false;
     }
+    if (!sdcache::loadCover(id, cv->data, THUMB_BYTES)) {
+        coverCache.erase(id);
+        freeAlignedPsram(cv->alloc);
+        delete cv;
+        xSemaphoreGive(coverCacheMtx);
+        return false;
+    }
+    syncCoverPixels(cv->data);
+    lv_image_cache_drop(&cv->dsc);
+    xSemaphoreGive(coverCacheMtx);
     return true;
 }
 
 static bool isCovered(const String &id) {
+    xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
     auto it = coverCache.find(id);
-    return it != coverCache.end() && it->second && it->second->data;
+    bool has = it != coverCache.end() && it->second && it->second->data;
+    xSemaphoreGive(coverCacheMtx);
+    return has;
 }
 
 // Background page fetch — runs on net task, writes into coverCache directly.
 // Must NOT touch LVGL objects. Returns true if all covers landed.
 static bool netFetchPageIntoCache(int page) {
     int start = page * PAGE_SIZE;
-    int count = min((int)allCards.size() - start, PAGE_SIZE);
+    int count = min((int)visibleCardIdx.size() - start, PAGE_SIZE);
     if (count <= 0) return true;
 
-    CachedCover *targets[PAGE_SIZE] = {nullptr};
+    // Snapshot card info while holding mutex, then release for slow I/O
+    struct FetchJob { String cardId; String coverUrl; String title; };
+    FetchJob jobs[PAGE_SIZE];
+    int jobCount = 0;
+
     xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
-    for (int i = 0; i < count; i++) targets[i] = getOrAllocCover(allCards[start + i].id);
+    for (int i = 0; i < count; i++) {
+        const CardMeta &card = visibleCardAt(start + i);
+        jobs[jobCount].cardId = card.id;
+        jobs[jobCount].coverUrl = card.coverUrl;
+        jobs[jobCount].title = card.title;
+        jobCount++;
+    }
     xSemaphoreGive(coverCacheMtx);
 
-    HTTPClient http;
-    String url = String(SERVER_BASE) + "/page565?page=" + page + "&size=" + PAGE_SIZE + pageQuerySuffix();
-    http.begin(url);
-    http.setTimeout(15000);
-    int code = http.GET();
-    if (code != 200) {
-        Serial.printf("[page565] page=%d HTTP %d\n", page, code);
-        http.end();
-        return false;
-    }
-
-    WiFiClient *stream = http.getStreamPtr();
-    bool ok = true;
-    for (int i = 0; i < count; i++) {
-        if (!targets[i] || !targets[i]->data) {
-            int skipped = 0;
-            while (skipped < THUMB_BYTES && http.connected()) {
-                uint8_t junk[1024];
-                int n = stream->readBytes(junk, min((int)sizeof(junk), THUMB_BYTES - skipped));
-                if (n <= 0) break;
-                skipped += n;
-            }
+    for (int i = 0; i < jobCount; i++) {
+        const String &cardId = jobs[i].cardId;
+        const String &coverUrl = jobs[i].coverUrl;
+        if (!cardId.length()) continue;
+        if (isCovered(cardId)) {
+            vTaskDelay(1);
             continue;
         }
-        size_t got = stream->readBytes(targets[i]->data, THUMB_BYTES);
-        if ((int)got != THUMB_BYTES) {
-            Serial.printf("[page565] page=%d slot=%d short read %u\n", page, i, (unsigned)got);
-            free(targets[i]->data);
-            delete targets[i];
-            xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
-            coverCache.erase(allCards[start + i].id);
-            xSemaphoreGive(coverCacheMtx);
-            ok = false;
-            break;
+
+        bool fetched = false;
+        uint8_t *coverPixels = nullptr;
+
+        // Try SD cache first
+        if (sdcache::hasCover(cardId)) {
+            coverPixels = (uint8_t *)heap_caps_malloc(THUMB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (coverPixels && sdcache::loadCover(cardId, coverPixels, THUMB_BYTES)) {
+                Serial.printf("[cover] %s from SD cache\n", cardId.c_str());
+                fetched = true;
+            } else if (coverPixels) {
+                heap_caps_free(coverPixels);
+                coverPixels = nullptr;
+            }
         }
-        sdcache::saveCover(allCards[start + i].id, targets[i]->data, THUMB_BYTES);
+
+        // Download + decode from Yoto CDN
+        if (!fetched && coverUrl.length() && yotoDownloadCover(coverUrl, &coverPixels, THUMB_SIZE)) {
+            sdcache::saveCover(cardId, coverPixels, THUMB_BYTES);
+            Serial.printf("[cover] %s (%s) downloaded OK\n", cardId.c_str(), jobs[i].title.c_str());
+            fetched = true;
+        }
+
+        if (!fetched) {
+            coverPixels = (uint8_t *)heap_caps_malloc(THUMB_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (coverPixels) {
+                memset(coverPixels, 0xEF, THUMB_BYTES);
+                Serial.printf("[cover] %s no cover\n", cardId.c_str());
+                fetched = true;
+            } else {
+                Serial.printf("[cover] %s no cover buffer\n", cardId.c_str());
+            }
+        }
+
+        if (fetched && coverPixels) {
+            // Commit under lock after slow I/O so LVGL never sees a partial cover.
+            xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
+            CachedCover *cv = getOrAllocCover(cardId);
+            if (cv && cv->data) {
+                memcpy(cv->data, coverPixels, THUMB_BYTES);
+                syncCoverPixels(cv->data);
+                // Note: lv_image_cache_drop removed from net task to avoid race with UI task.
+                // UI task will handle refresh in renderGrid().
+                Serial.printf("[cover] committed %s to buf %p\n", cardId.c_str(), cv->data);
+            }
+            xSemaphoreGive(coverCacheMtx);
+        }
+        if (coverPixels) heap_caps_free(coverPixels);
+        vTaskDelay(1);
     }
-    http.end();
-    return ok;
+    return true;
+}
+
+static bool netFillOneCover(int index) {
+    if (index < 0 || index >= (int)libraryCards.size()) return false;
+    CardMeta card = libraryCards[index];
+    if (!card.id.length() || !card.coverUrl.length()) return false;
+    if (sdcache::hasCover(card.id)) return false;
+
+    uint8_t *coverPixels = nullptr;
+    if (!yotoDownloadCover(card.coverUrl, &coverPixels, THUMB_SIZE)) return false;
+    bool saved = sdcache::saveCover(card.id, coverPixels, THUMB_BYTES);
+    if (coverPixels) heap_caps_free(coverPixels);
+    if (saved) {
+        Serial.printf("[cover] background cached %s (%d/%u)\n",
+            card.id.c_str(), index + 1, (unsigned)libraryCards.size());
+    }
+    vTaskDelay(1);
+    return saved;
 }
 
 static void freeUserStr(lv_event_t *e) {
@@ -512,6 +855,9 @@ static void freeUserStr(lv_event_t *e) {
 static lv_obj_t *cardDetail = nullptr;
 static char *cardDetailId = nullptr;   // strdup'd, freed on dismiss
 static lv_timer_t *detailFetchTimer = nullptr;
+static lv_obj_t *detailCoverImg = nullptr;
+static uint8_t *detailCoverPixels = nullptr;
+static lv_image_dsc_t detailCoverDsc;
 static lv_obj_t *detailDescLbl = nullptr;
 static lv_obj_t *detailChipsRow = nullptr;
 static lv_obj_t *detailAuthorLbl = nullptr;
@@ -519,13 +865,26 @@ static lv_obj_t *detailSeriesBtn = nullptr;
 static char *detailSeriesName = nullptr;
 
 static void reloadManifest();
+static void applyLocalLibraryView(int targetPage);
+
+static void clearDetailCoverPixels() {
+    if (detailCoverImg) lv_image_set_src(detailCoverImg, NULL);
+    if (detailCoverPixels) {
+        lv_image_cache_drop(&detailCoverDsc);
+        heap_caps_free(detailCoverPixels);
+        detailCoverPixels = nullptr;
+    }
+    memset(&detailCoverDsc, 0, sizeof(detailCoverDsc));
+}
 
 static void dismissCardDetail() {
     if (detailFetchTimer) { lv_timer_delete(detailFetchTimer); detailFetchTimer = nullptr; }
+    clearDetailCoverPixels();
     if (cardDetail) {
         lv_obj_delete_async(cardDetail);
         cardDetail = nullptr;
     }
+    detailCoverImg = nullptr;
     detailDescLbl = nullptr;
     detailChipsRow = nullptr;
     detailAuthorLbl = nullptr;
@@ -546,8 +905,9 @@ static void onDetailSeries(lv_event_t *) {
     if (detailSeriesName) {
         currentSeries = String(detailSeriesName);
         currentAuthor = "";
+        currentSource = "";
         dismissCardDetail();
-        reloadManifest();
+        applyLocalLibraryView(0);
         return;
     }
     dismissCardDetail();
@@ -557,11 +917,7 @@ static void onDetailSeries(lv_event_t *) {
 static void onDetailPlay(lv_event_t *) {
     if (!cardDetailId) return;
     Serial.printf("[ui] play %s\n", cardDetailId);
-    String id = cardDetailId;
-    String title;
-    for (auto &c : allCards) { if (c.id == id) { title = c.title; break; } }
-    if (nowPlayingLabel) lv_label_set_text_fmt(nowPlayingLabel, LV_SYMBOL_PLAY "  %s", title.c_str());
-    netPost((String("/play/") + id).c_str());
+    playCardNow(String(cardDetailId));
     dismissCardDetail();
 }
 
@@ -600,57 +956,69 @@ static void fetchDetailExtras(lv_timer_t *t) {
     lv_timer_delete(t);
     if (!cardDetail || !cardDetailId) return;
     netFetchDetail(cardDetailId);
+    netFetchDetailCover(cardDetailId);
+}
+
+static void processDetailCoverResult(const String &id, uint8_t *pixels) {
+    if (!cardDetail || !cardDetailId || id != String(cardDetailId) || !pixels) {
+        if (pixels) heap_caps_free(pixels);
+        return;
+    }
+    clearDetailCoverPixels();
+    detailCoverPixels = pixels;
+    memset(&detailCoverDsc, 0, sizeof(detailCoverDsc));
+    detailCoverDsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    detailCoverDsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    detailCoverDsc.header.w = DETAIL_COVER_SIZE;
+    detailCoverDsc.header.h = DETAIL_COVER_SIZE;
+    detailCoverDsc.header.stride = DETAIL_COVER_SIZE * 2;
+    detailCoverDsc.data_size = DETAIL_COVER_BYTES;
+    detailCoverDsc.data = detailCoverPixels;
+    syncPixels(detailCoverPixels, DETAIL_COVER_BYTES);
+
+    if (detailCoverImg) {
+        lv_image_cache_drop(&detailCoverDsc);
+        lv_image_set_src(detailCoverImg, &detailCoverDsc);
+        lv_image_set_scale(detailCoverImg, 256);
+        lv_obj_center(detailCoverImg);
+        lv_obj_invalidate(detailCoverImg);
+    }
 }
 
 // Process card detail result from net task.
-static void processDetailResult(const String &body) {
+static void processDetailResult(const YotoCardDetail &detail) {
     if (!cardDetail) return;
-    if (!body.length()) return;
 
-    JsonDocument doc;
-    if (deserializeJson(doc, body) != DeserializationError::Ok) return;
-
-    const char *author = doc["author"] | "";
-    const char *series = doc["series"] | "";
-    int seq = doc["sequence_number"] | -1;
-    int duration = doc["duration"] | 0;          // seconds
-    int trackCount = doc["track_count"] | 0;
-    int chapterCount = doc["chapter_count"] | 0;
-    const char *desc = doc["description"] | "";
-
-    if (detailAuthorLbl && author && *author) {
-        lv_label_set_text_fmt(detailAuthorLbl, LV_SYMBOL_EDIT "  by %s", author);
+    if (detailAuthorLbl && detail.author.length()) {
+        lv_label_set_text_fmt(detailAuthorLbl, LV_SYMBOL_EDIT "  by %s", detail.author.c_str());
     }
 
     if (detailChipsRow) {
         lv_obj_clean(detailChipsRow);
-        if (series && *series) {
+        if (detail.series.length()) {
             char buf[96];
-            if (seq > 0) snprintf(buf, sizeof(buf), "%s  #%d", series, seq);
-            else         snprintf(buf, sizeof(buf), "%s", series);
+            if (detail.sequenceNumber > 0) snprintf(buf, sizeof(buf), "%s  #%d", detail.series.c_str(), detail.sequenceNumber);
+            else                           snprintf(buf, sizeof(buf), "%s", detail.series.c_str());
             addChip(detailChipsRow, LV_SYMBOL_LIST, buf, 0x6f42c1);
         }
-        if (duration > 0) {
+        if (detail.duration > 0) {
             char buf[32];
-            int h = duration / 3600, m = (duration % 3600) / 60;
+            int h = detail.duration / 3600, m = (detail.duration % 3600) / 60;
             if (h > 0) snprintf(buf, sizeof(buf), "%dh %02dm", h, m);
             else       snprintf(buf, sizeof(buf), "%d min", m ? m : 1);
             addChip(detailChipsRow, LV_SYMBOL_AUDIO, buf, 0x1f6feb);
-        }
-        if (trackCount > 0 || chapterCount > 0) {
-            (void)trackCount; (void)chapterCount;
         }
     }
 
     // Capture series name for the Series button.
     if (detailSeriesName) { free(detailSeriesName); detailSeriesName = nullptr; }
-    if (series && *series) {
-        detailSeriesName = strdup(series);
+    if (detail.series.length()) {
+        detailSeriesName = strdup(detail.series.c_str());
         if (detailSeriesBtn) lv_obj_remove_flag(detailSeriesBtn, LV_OBJ_FLAG_HIDDEN);
     }
 
-    if (detailDescLbl && desc && *desc) {
-        lv_label_set_text(detailDescLbl, desc);
+    if (detailDescLbl && detail.description.length()) {
+        lv_label_set_text(detailDescLbl, detail.description.c_str());
     } else if (detailDescLbl) {
         lv_label_set_text(detailDescLbl, "Tap PLAY to begin the story.");
     }
@@ -660,12 +1028,14 @@ static void openCardDetail(const char *id, const char *title) {
     if (cardDetail) return;
     cardDetailId = strdup(id ? id : "");
 
+    // Find known metadata from the full library immediately.
+    const CardMeta *known = nullptr;
+    for (const auto &c : libraryCards) { if (c.id == String(cardDetailId)) { known = &c; break; } }
+
     // Per-card colour theme.
     uint16_t hue = hueForId(cardDetailId);
     lv_color_t accent = lv_color_hsv_to_rgb(hue, 70, 95);
-    lv_color_t accentDark = lv_color_hsv_to_rgb(hue, 80, 30);
     lv_color_t bgTop = lv_color_hsv_to_rgb(hue, 35, 22);
-    lv_color_t bgBot = lv_color_hsv_to_rgb((hue + 30) % 360, 50, 12);
 
     cardDetail = lv_obj_create(lv_screen_active());
     lv_obj_set_size(cardDetail, LCD_W, LCD_H);
@@ -694,10 +1064,10 @@ static void openCardDetail(const char *id, const char *title) {
     lv_obj_set_style_text_color(backLbl, lv_color_hex(0xffffff), 0);
     lv_obj_center(backLbl);
 
-    // Cover — floating glow, gentle bob.
+    // Cover — floating glow
     lv_obj_t *coverWrap = lv_obj_create(cardDetail);
-    lv_obj_set_size(coverWrap, THUMB_SIZE + 16, THUMB_SIZE + 16);
-    lv_obj_align(coverWrap, LV_ALIGN_LEFT_MID, 60, 0);
+    lv_obj_set_size(coverWrap, DETAIL_COVER_SIZE + 20, DETAIL_COVER_SIZE + 20);
+    lv_obj_align(coverWrap, LV_ALIGN_LEFT_MID, 42, 0);
     lv_obj_set_style_bg_color(coverWrap, lv_color_hex(0x161b22), 0);
     lv_obj_set_style_bg_opa(coverWrap, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(coverWrap, 3, 0);
@@ -706,12 +1076,13 @@ static void openCardDetail(const char *id, const char *title) {
     lv_obj_set_style_pad_all(coverWrap, 8, 0);
     lv_obj_remove_flag(coverWrap, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *img = lv_image_create(coverWrap);
-    auto cv = coverCache.find(String(id));
+    detailCoverImg = lv_image_create(coverWrap);
+    auto cv = coverCache.find(String(cardDetailId));
     if (cv != coverCache.end() && cv->second && cv->second->data) {
-        lv_image_set_src(img, &cv->second->dsc);
+        lv_image_set_src(detailCoverImg, &cv->second->dsc);
+        lv_image_set_scale(detailCoverImg, (uint32_t)(256 * DETAIL_COVER_SIZE / THUMB_SIZE));
     }
-    lv_obj_align(img, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(detailCoverImg, LV_ALIGN_CENTER, 0, 0);
 
     // Right column container.
     lv_obj_t *right = lv_obj_create(cardDetail);
@@ -732,14 +1103,18 @@ static void openCardDetail(const char *id, const char *title) {
     lv_obj_set_style_text_align(titleLbl, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_align(titleLbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    // Author (filled in by fetch).
+    // Author (filled immediately if known).
     detailAuthorLbl = lv_label_create(right);
-    lv_label_set_text(detailAuthorLbl, LV_SYMBOL_EDIT "  ...");
+    if (known && known->author.length()) {
+        lv_label_set_text_fmt(detailAuthorLbl, LV_SYMBOL_EDIT "  by %s", known->author.c_str());
+    } else {
+        lv_label_set_text(detailAuthorLbl, LV_SYMBOL_EDIT "  ...");
+    }
     lv_obj_set_style_text_color(detailAuthorLbl, lv_color_hex(0xc9d1d9), 0);
     lv_obj_set_style_text_font(detailAuthorLbl, &lv_font_montserrat_16, 0);
     lv_obj_align(detailAuthorLbl, LV_ALIGN_TOP_LEFT, 2, 64);
 
-    // Chips row (filled in by fetch). 36 px tall, sits right under the author.
+    // Chips row
     detailChipsRow = lv_obj_create(right);
     lv_obj_set_size(detailChipsRow, 410, 36);
     lv_obj_align(detailChipsRow, LV_ALIGN_TOP_LEFT, 0, 92);
@@ -751,8 +1126,24 @@ static void openCardDetail(const char *id, const char *title) {
     lv_obj_set_flex_align(detailChipsRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(detailChipsRow, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Description container — fixed size, clips overflow so a long blurb
-    // can never paint over the PLAY / Series buttons.
+    if (known && known->series.length()) {
+        char buf[96];
+        if (known->sequenceNumber > 0) snprintf(buf, sizeof(buf), "%s  #%d", known->series.c_str(), known->sequenceNumber);
+        else                           snprintf(buf, sizeof(buf), "%s", known->series.c_str());
+        addChip(detailChipsRow, LV_SYMBOL_LIST, buf, 0x6f42c1);
+    }
+    if (known && known->duration > 0) {
+        char buf[32];
+        int h = known->duration / 3600, m = (known->duration % 3600) / 60;
+        if (h > 0) snprintf(buf, sizeof(buf), "%dh %02dm", h, m);
+        else       snprintf(buf, sizeof(buf), "%d min", m ? m : 1);
+        addChip(detailChipsRow, LV_SYMBOL_AUDIO, buf, 0x1f6feb);
+    }
+    if (known && known->category.length()) {
+        addChip(detailChipsRow, LV_SYMBOL_DIRECTORY, known->category.c_str(), 0x8b949e);
+    }
+
+    // Description container
     lv_obj_t *descBox = lv_obj_create(right);
     lv_obj_set_size(descBox, 410, 160);
     lv_obj_align(descBox, LV_ALIGN_TOP_LEFT, 0, 136);
@@ -763,7 +1154,8 @@ static void openCardDetail(const char *id, const char *title) {
     lv_obj_remove_flag(descBox, LV_OBJ_FLAG_SCROLLABLE);
 
     detailDescLbl = lv_label_create(descBox);
-    lv_label_set_text(detailDescLbl, "Loading...");
+    if (known && known->description.length()) lv_label_set_text(detailDescLbl, known->description.c_str());
+    else                                     lv_label_set_text(detailDescLbl, "Loading...");
     lv_label_set_long_mode(detailDescLbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(detailDescLbl, 410);
     lv_obj_set_style_text_color(detailDescLbl, lv_color_hex(0xe6edf3), 0);
@@ -771,49 +1163,39 @@ static void openCardDetail(const char *id, const char *title) {
     lv_obj_set_style_text_line_space(detailDescLbl, 4, 0);
     lv_obj_align(detailDescLbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    // PLAY button — modestly sized, bottom-right of the right column.
+    // PLAY button
     lv_obj_t *playBtn = lv_btn_create(right);
     lv_obj_set_size(playBtn, 180, 70);
     lv_obj_align(playBtn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
     lv_obj_set_style_bg_color(playBtn, lv_color_hex(0x2ea043), 0);
-    lv_obj_set_style_bg_grad_color(playBtn, lv_color_hex(0x238636), 0);
-    lv_obj_set_style_bg_grad_dir(playBtn, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_bg_color(playBtn, lv_color_hex(0x238636), LV_STATE_PRESSED);
     lv_obj_set_style_radius(playBtn, 35, 0);
-    lv_obj_set_style_border_width(playBtn, 2, 0);
-    lv_obj_set_style_border_color(playBtn, lv_color_hex(0x4a6a3a), 0);
-    lv_obj_set_style_border_color(playBtn, lv_color_hex(0x58a6ff), LV_STATE_PRESSED);
     lv_obj_add_event_cb(playBtn, onDetailPlay, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *playLbl = lv_label_create(playBtn);
     lv_label_set_text(playLbl, LV_SYMBOL_PLAY "  PLAY");
     lv_obj_set_style_text_font(playLbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(playLbl, lv_color_hex(0xffffff), 0);
     lv_obj_center(playLbl);
 
-    // Series button — left of PLAY. Hidden until fetchDetailExtras
-    // confirms the card belongs to a series.
+    // Series button
     detailSeriesBtn = lv_btn_create(right);
     lv_obj_set_size(detailSeriesBtn, 180, 70);
     lv_obj_align(detailSeriesBtn, LV_ALIGN_BOTTOM_RIGHT, -200, 0);
     lv_obj_set_style_bg_color(detailSeriesBtn, lv_color_hex(0x6f42c1), 0);
-    lv_obj_set_style_bg_color(detailSeriesBtn, lv_color_hex(0x553098), LV_STATE_PRESSED);
     lv_obj_set_style_radius(detailSeriesBtn, 35, 0);
-    lv_obj_set_style_border_width(detailSeriesBtn, 2, 0);
-    lv_obj_set_style_border_color(detailSeriesBtn, lv_color_hex(0x4a3570), 0);
-    lv_obj_set_style_border_color(detailSeriesBtn, lv_color_hex(0x58a6ff), LV_STATE_PRESSED);
     lv_obj_add_event_cb(detailSeriesBtn, onDetailSeries, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *sLbl = lv_label_create(detailSeriesBtn);
     lv_label_set_text(sLbl, LV_SYMBOL_LIST "  Series");
     lv_obj_set_style_text_font(sLbl, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(sLbl, lv_color_hex(0xffffff), 0);
     lv_obj_center(sLbl);
-    lv_obj_add_flag(detailSeriesBtn, LV_OBJ_FLAG_HIDDEN);
+    
+    if (known && known->series.length()) {
+        detailSeriesName = strdup(known->series.c_str());
+        lv_obj_remove_flag(detailSeriesBtn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(detailSeriesBtn, LV_OBJ_FLAG_HIDDEN);
+    }
 
-    // Kick the metadata fetch immediately (one HTTP req on the LVGL task).
     detailFetchTimer = lv_timer_create(fetchDetailExtras, 20, nullptr);
     lv_timer_set_repeat_count(detailFetchTimer, 1);
-
-    (void)accentDark; // reserved for future use
 }
 
 static void onCardClick(lv_event_t *e) {
@@ -826,97 +1208,86 @@ static void onCardClick(lv_event_t *e) {
 // PSRAM usage.  Keep current page ± 1 page worth of cards.
 static void evictDistantCovers() {
     int keepStart = max(0, (currentPage - 1) * PAGE_SIZE);
-    int keepEnd   = min((int)allCards.size(), (currentPage + 2) * PAGE_SIZE);
+    int keepEnd   = min((int)visibleCardIdx.size(), (currentPage + 2) * PAGE_SIZE);
     // Build a set of IDs to keep.
     std::set<String> keep;
-    for (int i = keepStart; i < keepEnd; i++) keep.insert(allCards[i].id);
+    for (int i = keepStart; i < keepEnd; i++) keep.insert(visibleCardAt(i).id);
     // Walk the cache and free anything outside the keep set.
+    xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
     for (auto it = coverCache.begin(); it != coverCache.end(); ) {
         if (keep.count(it->first) == 0) {
-            if (it->second) { free(it->second->data); delete it->second; }
+            if (it->second) {
+                const lv_image_dsc_t *src = &it->second->dsc;
+                for (int i = 0; i < PAGE_SIZE; i++) {
+                    if (slotImg[i] && lv_image_get_src(slotImg[i]) == src) {
+                        lv_image_set_src(slotImg[i], NULL);
+                    }
+                }
+                lv_image_cache_drop(src);
+                freeAlignedPsram(it->second->alloc);
+                delete it->second;
+            }
             it = coverCache.erase(it);
         } else {
             ++it;
         }
     }
+    xSemaphoreGive(coverCacheMtx);
 }
 
 static void renderGrid() {
-    if (grid) lv_obj_clean(grid);
     evictDistantCovers();
-    for (int i = 0; i < PAGE_SIZE; i++) slotImg[i] = nullptr;
-
-    int cellW = LCD_W / GRID_COLS;
-    int cellH = (LCD_H - 60 - 40 - 60) / GRID_ROWS;
 
     int start = currentPage * PAGE_SIZE;
-    int end = min((int)allCards.size(), start + PAGE_SIZE);
+    int end = min((int)visibleCardIdx.size(), start + PAGE_SIZE);
 
-    for (int i = 0; i < end - start; i++) {
-        const CardMeta &cm = allCards[start + i];
-        slotId[i] = cm.id;
+    xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        lv_obj_t *cont = lv_obj_get_child(grid, i);
+        if (!cont) continue;
 
-        int col = i % GRID_COLS;
-        int row = i / GRID_COLS;
+        if (i < end - start) {
+            const CardMeta &cm = visibleCardAt(start + i);
+            slotId[i] = cm.id;
 
-        lv_obj_t *cont = lv_obj_create(grid);
-        lv_obj_set_size(cont, cellW - 16, cellH - 8);
-        lv_obj_set_pos(cont, col * cellW + 8, row * cellH + 4);
-        lv_obj_set_style_bg_color(cont, lv_color_hex(0x1c2128), 0);
-        lv_obj_set_style_border_width(cont, 1, 0);
-        lv_obj_set_style_border_color(cont, lv_color_hex(0x2d333b), 0);
-        lv_obj_set_style_radius(cont, 12, 0);
-        lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_style_pad_all(cont, 2, 0);
-        // Tactile press feedback: brighter border (no transform_scale —
-        // each scaled card needs a ~126 KB layer buffer and we have 8 visible).
-        lv_obj_set_style_border_color(cont, lv_color_hex(0x58a6ff), LV_STATE_PRESSED);
+            lv_obj_t *img = lv_obj_get_child(cont, 0);
+            lv_obj_t *l = lv_obj_get_child(cont, 1);
+            lv_obj_t *badge = lv_obj_get_child(cont, 2);
 
-        lv_obj_t *img = lv_image_create(cont);
-        lv_obj_set_size(img, THUMB_SIZE, THUMB_SIZE);
-        lv_obj_set_style_bg_color(img, lv_color_hex(0x2a313a), 0);
-        lv_obj_set_style_bg_opa(img, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(img, 8, 0);
-        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 0);
-        auto cv = coverCache.find(cm.id);
-        if (cv != coverCache.end() && cv->second && cv->second->data) {
-            lv_image_set_src(img, &cv->second->dsc);
+            lv_label_set_text(l, cm.title.c_str());
+            if (badge) {
+                if (cm.sequenceNumber > 0) {
+                    lv_label_set_text_fmt(badge, "#%d", cm.sequenceNumber);
+                    lv_obj_remove_flag(badge, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+                }
+            }
+            
+            auto it = coverCache.find(cm.id);
+            if (it != coverCache.end() && it->second && it->second->data) {
+                lv_image_cache_drop(&it->second->dsc);
+                lv_image_set_src(img, NULL);
+                lv_image_set_src(img, &it->second->dsc);
+                lv_obj_invalidate(img); // Force redraw
+            } else {
+                lv_image_set_src(img, NULL);
+            }
+            slotImg[i] = img;
+
+            // Update user data (title string) for the detail view
+            char *oldTitle = (char *)lv_obj_get_user_data(cont);
+            if (oldTitle) free(oldTitle);
+            lv_obj_set_user_data(cont, strdup(cm.title.c_str()));
+            
+            lv_obj_remove_flag(cont, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(cont, LV_OBJ_FLAG_HIDDEN);
+            slotImg[i] = nullptr;
+            slotId[i] = "";
         }
-        slotImg[i] = img;
-
-        // Title overlay across the bottom of the cover: solid dark band so
-        // white text reads cleanly on any cover artwork. Wraps to 2 lines
-        // when the title is long, so series like "Amelia Fang and the ..."
-        // remain distinguishable.
-        lv_obj_t *l = lv_label_create(cont);
-        lv_label_set_text(l, cm.title.c_str());
-        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(l, THUMB_SIZE);
-        lv_obj_set_style_max_height(l, 40, 0);
-        lv_obj_set_style_bg_color(l, lv_color_hex(0x0a0a0a), 0);
-        lv_obj_set_style_bg_opa(l, LV_OPA_COVER, 0);
-        lv_obj_set_style_text_color(l, lv_color_white(), 0);
-        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_line_space(l, 1, 0);
-        lv_obj_set_style_pad_hor(l, 4, 0);
-        lv_obj_set_style_pad_ver(l, 2, 0);
-        lv_obj_set_style_radius(l, 0, 0);
-        // Align to the bottom of the image, not the container, so the band
-        // sits cleanly on the cover.
-        lv_obj_align_to(l, img, LV_ALIGN_BOTTOM_MID, 0, 0);
-
-        char *idStr = strdup(cm.id.c_str());
-        char *titleStr = strdup(cm.title.c_str());
-        lv_obj_add_event_cb(cont, onCardClick, LV_EVENT_CLICKED, idStr);
-        lv_obj_add_event_cb(cont, freeUserStr, LV_EVENT_DELETE, idStr);
-        lv_obj_set_user_data(cont, titleStr);
-        lv_obj_add_event_cb(cont, [](lv_event_t *e) {
-            char *t = (char *)lv_obj_get_user_data((lv_obj_t *)lv_event_get_target(e));
-            if (t) free(t);
-        }, LV_EVENT_DELETE, nullptr);
-        lv_obj_add_flag(cont, LV_OBJ_FLAG_CLICKABLE);
     }
+    xSemaphoreGive(coverCacheMtx);
 
     lv_label_set_text_fmt(pageLabel, "Page %d / %d", currentPage + 1, maxPageCount());
 }
@@ -925,23 +1296,60 @@ static void loadPage(int page);
 static void flashBtn(lv_obj_t *b);
 
 // ---------- manifest persistence (NVS) ----------
-// Stored as a compact length-prefixed binary blob keyed by current filter
-// signature. Hand-rolled to avoid ArduinoJson allocations on a tight heap.
+// Legacy compact NVS manifest helpers. The active library manifest lives on SD.
 //
 // Layout: [u8 sig_len][sig bytes][u16 card_count]
 //   repeated card_count times:
 //     [u8 id_len][id bytes][u8 title_len][title bytes]
 
 static String manifestSignature() {
-    return currentSort + "|" + currentAuthor + "|" + currentSeries;
+    return "library-v4";
+}
+
+static void updateFilterButtonLabel() {
+    if (filterBtnLabel) {
+        String fb;
+        if (currentSeries.length())      fb = String(LV_SYMBOL_LIST "  ") + currentSeries;
+        else if (currentAuthor.length()) fb = String(LV_SYMBOL_EDIT "  ") + currentAuthor;
+        else                              fb = String(LV_SYMBOL_LIST "  Series");
+        lv_label_set_text(filterBtnLabel, fb.c_str());
+    }
+    if (creativeTopBtn) {
+        lv_obj_set_style_bg_color(creativeTopBtn, lv_color_hex(currentSource == "creative" ? 0x238636 : 0x30363d), 0);
+    }
+    if (purchasedTopBtn) {
+        lv_obj_set_style_bg_color(purchasedTopBtn, lv_color_hex(currentSource == "purchased" ? 0x1f6feb : 0x30363d), 0);
+    }
+}
+
+static void saveUiState() {
+    Preferences p;
+    if (!p.begin("yoto_ui", false)) return;
+    p.putString("sort", currentSort);
+    p.putString("author", currentAuthor);
+    p.putString("series", currentSeries);
+    p.putString("source", currentSource);
+    p.putInt("page", currentPage);
+    p.end();
+}
+
+static void loadUiState() {
+    Preferences p;
+    if (!p.begin("yoto_ui", true)) return;
+    currentSort = p.getString("sort", currentSort);
+    currentAuthor = p.getString("author", currentAuthor);
+    currentSeries = p.getString("series", currentSeries);
+    currentSource = p.getString("source", currentSource);
+    restorePage = max(0, (int)p.getInt("page", 0));
+    p.end();
 }
 
 static void saveManifestNvs() {
-    if (allCards.empty()) return;
+    if (libraryCards.empty()) return;
     String sig = manifestSignature();
     // Pre-compute size to allocate once.
     size_t total = 1 + sig.length() + 2;
-    for (const auto &c : allCards) {
+    for (const auto &c : libraryCards) {
         if (c.id.length() > 255 || c.title.length() > 255) return;  // bail on weird data
         total += 1 + c.id.length() + 1 + c.title.length();
     }
@@ -955,10 +1363,10 @@ static void saveManifestNvs() {
     size_t o = 0;
     buf[o++] = (uint8_t)sig.length();
     memcpy(buf + o, sig.c_str(), sig.length()); o += sig.length();
-    uint16_t n = (uint16_t)allCards.size();
+    uint16_t n = (uint16_t)libraryCards.size();
     buf[o++] = (uint8_t)(n & 0xFF);
     buf[o++] = (uint8_t)(n >> 8);
-    for (const auto &c : allCards) {
+    for (const auto &c : libraryCards) {
         buf[o++] = (uint8_t)c.id.length();
         memcpy(buf + o, c.id.c_str(), c.id.length()); o += c.id.length();
         buf[o++] = (uint8_t)c.title.length();
@@ -995,8 +1403,8 @@ static bool loadManifestNvs() {
     if (sig != manifestSignature()) { free(buf); return false; }
     uint16_t n = buf[o] | (buf[o + 1] << 8); o += 2;
 
-    allCards.clear();
-    allCards.reserve(n);
+    libraryCards.clear();
+    libraryCards.reserve(n);
     for (uint16_t i = 0; i < n && o < len; i++) {
         uint8_t idl = buf[o++]; if (o + idl > len) break;
         CardMeta m;
@@ -1006,89 +1414,115 @@ static bool loadManifestNvs() {
         uint8_t tl = buf[o++]; if (o + tl > len) break;
         m.title.reserve(tl);
         for (uint8_t k = 0; k < tl; k++) m.title += (char)buf[o++];
-        if (m.id.length()) allCards.push_back(m);
+        if (m.id.length()) libraryCards.push_back(m);
     }
     free(buf);
-    Serial.printf("[nvs] loaded manifest %u cards\n", (unsigned)allCards.size());
-    return !allCards.empty();
+    Serial.printf("[nvs] loaded manifest %u cards\n", (unsigned)libraryCards.size());
+    return !libraryCards.empty();
 }
 
-// Pull a fresh manifest from the server using current filter+sort and reset the grid to page 0.
+static void applyLibraryView(int targetPage) {
+    visibleCardIdx.clear();
+    visibleCardIdx.reserve(libraryCards.size());
+
+    for (int i = 0; i < (int)libraryCards.size(); i++) {
+        const CardMeta &card = libraryCards[i];
+        if (!cardMatchesSource(card)) continue;
+        if (currentAuthor.length() && card.author != currentAuthor) continue;
+        if (currentSeries.length() && card.series != currentSeries) continue;
+        visibleCardIdx.push_back((uint16_t)i);
+    }
+
+    if (currentSeries.length()) {
+        std::sort(visibleCardIdx.begin(), visibleCardIdx.end(),
+            [](uint16_t a, uint16_t b) { return cardComesBeforeInSeries(libraryCards[a], libraryCards[b]); });
+    } else if (currentSort == "title_desc") {
+        std::sort(visibleCardIdx.begin(), visibleCardIdx.end(),
+            [](uint16_t a, uint16_t b) { return libraryCards[a].title > libraryCards[b].title; });
+    } else if (currentSort == "author") {
+        std::sort(visibleCardIdx.begin(), visibleCardIdx.end(),
+            [](uint16_t a, uint16_t b) {
+                const CardMeta &ca = libraryCards[a];
+                const CardMeta &cb = libraryCards[b];
+                if (ca.author != cb.author) return ca.author < cb.author;
+                return ca.title < cb.title;
+            });
+    } else {
+        std::sort(visibleCardIdx.begin(), visibleCardIdx.end(),
+            [](uint16_t a, uint16_t b) { return libraryCards[a].title < libraryCards[b].title; });
+    }
+
+    Serial.printf("[manifest] view %u/%u cards (source=%s, author=%s, series=%s, sort=%s)\n",
+                  (unsigned)visibleCardIdx.size(), (unsigned)libraryCards.size(),
+                  currentSource.length() ? currentSource.c_str() : "*",
+                  currentAuthor.length() ? currentAuthor.c_str() : "*",
+                  currentSeries.length() ? currentSeries.c_str() : "*",
+                  currentSort.c_str());
+
+    updateFilterButtonLabel();
+    cacheFillIndex = 0;
+    cacheFillInFlight = false;
+    pendingPage = -1;
+    loadPage(min(max(0, targetPage), maxPageCount() - 1));
+}
+
+static void applyLocalLibraryView(int targetPage) {
+    if (libraryCards.empty()) {
+        lv_label_set_text(statusLabel, "No library cache");
+        return;
+    }
+    applyLibraryView(targetPage);
+}
+
+// Pull a fresh full manifest from Yoto. Filtering/sorting is applied locally after it arrives.
 // Now non-blocking: enqueues the request to the net task. Result is polled in loop().
 static void reloadManifest() {
-    if (filterBtnLabel) {
-        String fb;
-        if (currentSeries.length())      fb = String(LV_SYMBOL_LIST "  ") + currentSeries;
-        else if (currentAuthor.length()) fb = String(LV_SYMBOL_EDIT "  ") + currentAuthor;
-        else                              fb = String(LV_SYMBOL_LIST "  Series");
-        lv_label_set_text(filterBtnLabel, fb.c_str());
-    }
-    lv_label_set_text(statusLabel, "Loading...");
+    updateFilterButtonLabel();
+    lv_label_set_text(statusLabel, "Refreshing...");
     netFetchManifest();
 }
 
 // Process manifest result from net task (called from loop polling).
-static void processManifestResult(const String &body) {
-    allCards.clear();
-    if (body.length()) {
-        JsonDocument doc;
-        if (deserializeJson(doc, body) == DeserializationError::Ok) {
-            JsonArray cards = doc["cards"].as<JsonArray>();
-            for (JsonObject c : cards) {
-                CardMeta m;
-                m.id = String((const char *)(c["cardId"] | ""));
-                m.title = String((const char *)(c["title"] | "?"));
-                if (m.id.length()) allCards.push_back(m);
-            }
-        }
+static void processManifestResult(std::vector<CardMeta> cards, bool ok) {
+    if (!ok) {
+        Serial.println("[manifest] refresh failed; keeping existing cards");
+        if (statusLabel) lv_label_set_text(statusLabel, visibleCardIdx.empty() ? "Refresh failed" : "Offline cache");
+        hideBootSplash();
+        loading = false;
+        return;
     }
-    Serial.printf("[manifest] %u cards (author=%s, series=%s, sort=%s)\n",
-                  (unsigned)allCards.size(),
-                  currentAuthor.length() ? currentAuthor.c_str() : "*",
-                  currentSeries.length() ? currentSeries.c_str() : "*",
-                  currentSort.c_str());
-    if (allCards.size()) sdcache::saveManifest(manifestSignature(), allCards);
-    pendingPage = -1;
-    loadPage(0);
+
+    libraryCards = std::move(cards);
+    if (libraryCards.size()) sdcache::saveManifest(manifestSignature(), libraryCards);
+    int targetPage = restorePage;
+    restorePage = 0;
+    applyLibraryView(targetPage);
+    hideBootSplash();
 }
 
 static void loadPage(int page) {
     loading = true;
     currentPage = page;
     pendingPage = -1;
+    saveUiState();
 
     // Render skeleton immediately (uses cache for covers already present).
     renderGrid();
 
-    // SD pass first — fills the cache from disk for anything not already in PSRAM.
-    int start = page * PAGE_SIZE;
-    int count = min((int)allCards.size() - start, PAGE_SIZE);
-    for (int i = 0; i < count; i++) {
-        const String &id = allCards[start + i].id;
-        if (!isCovered(id)) {
-            if (tryLoadCoverFromSd(id) && slotImg[i] && slotId[i] == id) {
-                lv_image_set_src(slotImg[i], &coverCache[id]->dsc);
-                lv_obj_invalidate(slotImg[i]);
-            }
-        }
-    }
-
     // Check which covers on this page are still missing.
+    int start = page * PAGE_SIZE;
+    int count = min((int)visibleCardIdx.size() - start, PAGE_SIZE);
     bool allCached = true;
     for (int i = 0; i < count; i++) {
-        if (!isCovered(allCards[start + i].id)) { allCached = false; break; }
+        if (!isCovered(visibleCardAt(start + i).id)) { allCached = false; break; }
     }
 
     if (allCached) {
         lv_label_set_text(statusLabel, "Ready");
         loading = false;
-    } else if (WiFi.status() == WL_CONNECTED) {
+    } else {
         lv_label_set_text(statusLabel, "Loading covers...");
         netFetchPage(page);
-        // loading stays true until netPageReady is polled in loop()
-    } else {
-        lv_label_set_text(statusLabel, "Offline");
-        loading = false;
     }
 }
 
@@ -1101,15 +1535,15 @@ static int nextPrefetchPage() {
     for (int d = 0; d <= 1; d++) {
         int a = currentPage + d;
         if (a >= 0 && a < total) {
-            for (int i = a * PAGE_SIZE; i < min((int)allCards.size(), (a + 1) * PAGE_SIZE); i++) {
-                if (!isCovered(allCards[i].id)) return a;
+            for (int i = a * PAGE_SIZE; i < min((int)visibleCardIdx.size(), (a + 1) * PAGE_SIZE); i++) {
+                if (!isCovered(visibleCardAt(i).id)) return a;
             }
         }
         if (d == 0) continue; // don't check currentPage - 0 twice
         int b = currentPage - d;
         if (b >= 0 && b < total) {
-            for (int i = b * PAGE_SIZE; i < min((int)allCards.size(), (b + 1) * PAGE_SIZE); i++) {
-                if (!isCovered(allCards[i].id)) return b;
+            for (int i = b * PAGE_SIZE; i < min((int)visibleCardIdx.size(), (b + 1) * PAGE_SIZE); i++) {
+                if (!isCovered(visibleCardAt(i).id)) return b;
             }
         }
     }
@@ -1119,25 +1553,6 @@ static int nextPrefetchPage() {
 static void backgroundPrefetch() {
     if (loading || pendingPage >= 0) return;
 
-    // Cheap pass: pull from SD first (no WiFi needed, ~1 ms per cover).
-    // We do at most one cover per tick to avoid stalling LVGL.
-    for (size_t i = 0; i < allCards.size(); i++) {
-        const String &id = allCards[i].id;
-        if (isCovered(id)) continue;
-        if (!sdcache::hasCover(id)) continue;
-        if (tryLoadCoverFromSd(id)) {
-            // If it landed on the current page, refresh that tile.
-            int p = i / PAGE_SIZE;
-            int s = i % PAGE_SIZE;
-            if (p == currentPage && slotImg[s] && slotId[s] == id) {
-                lv_image_set_src(slotImg[s], &coverCache[id]->dsc);
-                lv_obj_invalidate(slotImg[s]);
-            }
-            return;  // one per tick
-        }
-    }
-
-    if (WiFi.status() != WL_CONNECTED) return;
     int p = nextPrefetchPage();
     if (p < 0) return;
     loading = true;
@@ -1145,30 +1560,62 @@ static void backgroundPrefetch() {
     // loading cleared when netPageReady is consumed in loop()
 }
 
+static void backgroundCacheFill() {
+    if (loading || pendingPage >= 0 || cacheFillInFlight || libraryCards.empty()) return;
+    if (cacheFillIndex >= (int)libraryCards.size()) return;
+
+    int start = cacheFillIndex;
+    for (int attempts = 0; attempts < (int)libraryCards.size(); attempts++) {
+        int idx = (start + attempts) % (int)libraryCards.size();
+        if (libraryCards[idx].coverUrl.length() && !sdcache::hasCover(libraryCards[idx].id)) {
+            cacheFillIndex = idx;
+            cacheFillInFlight = true;
+            netFillCover(idx);
+            return;
+        }
+    }
+    cacheFillIndex = (int)libraryCards.size();
+}
+
 static void onPrev(lv_event_t *) {
     flashBtn(prevBtn);
     int p = (pendingPage >= 0 ? pendingPage : currentPage);
     if (p > 0) {
-        if (loading) lv_label_set_text(statusLabel, "Loading...");
-        loadPage(p - 1);
+        int target = p - 1;
+        if (loading) {
+            pendingPage = target;
+            currentPage = target;
+            renderGrid();
+            lv_label_set_text(statusLabel, "Loading...");
+        } else {
+            loadPage(target);
+        }
     }
 }
 static void onNext(lv_event_t *) {
     flashBtn(nextBtn);
     int p = (pendingPage >= 0 ? pendingPage : currentPage);
     if (p + 1 < maxPageCount()) {
-        if (loading) lv_label_set_text(statusLabel, "Loading...");
-        loadPage(p + 1);
+        int target = p + 1;
+        if (loading) {
+            pendingPage = target;
+            currentPage = target;
+            renderGrid();
+            lv_label_set_text(statusLabel, "Loading...");
+        } else {
+            loadPage(target);
+        }
     }
 }
-static void onPause(lv_event_t *)  { netPost("/pause"); }
-static void onResume(lv_event_t *) { netPost("/resume"); }
+static void onPause(lv_event_t *)  { netPause(); }
+static void onResume(lv_event_t *) { netResume(); }
 
 static void onHomeClick(lv_event_t *) {
-    if (currentSeries.length() || currentAuthor.length()) {
+    if (currentSeries.length() || currentAuthor.length() || currentSource.length()) {
         currentSeries = "";
         currentAuthor = "";
-        reloadManifest();
+        currentSource = "";
+        applyLocalLibraryView(0);
     }
 }
 
@@ -1193,16 +1640,43 @@ static void onAuthorPick(lv_event_t *e) {
     const char *name = (const char *)lv_event_get_user_data(e);
     currentAuthor = (name && name[0]) ? String(name) : String("");
     currentSeries = "";
+    currentSource = "";
     dismissModal();
-    reloadManifest();
+    applyLocalLibraryView(0);
+}
+
+static void onSourcePick(lv_event_t *e) {
+    const char *source = (const char *)lv_event_get_user_data(e);
+    currentSource = (source && source[0]) ? String(source) : String("");
+    currentAuthor = "";
+    currentSeries = "";
+    dismissModal();
+    applyLocalLibraryView(0);
+}
+
+static void setSourceFilter(const char *source) {
+    String next = (source && source[0]) ? String(source) : String("");
+    currentSource = (currentSource == next) ? String("") : next;
+    currentAuthor = "";
+    currentSeries = "";
+    applyLocalLibraryView(0);
+}
+
+static void onCreativeTop(lv_event_t *) {
+    setSourceFilter("creative");
+}
+
+static void onPurchasedTop(lv_event_t *) {
+    setSourceFilter("purchased");
 }
 
 static void onSeriesPick(lv_event_t *e) {
     const char *name = (const char *)lv_event_get_user_data(e);
     currentSeries = (name && name[0]) ? String(name) : String("");
     currentAuthor = "";
+    currentSource = "";
     dismissModal();
-    reloadManifest();
+    applyLocalLibraryView(0);
 }
 
 static void freePickStr(lv_event_t *e) {
@@ -1217,13 +1691,8 @@ static void openFilterModal(lv_event_t *) {
 }
 
 // Build filter modal from fetched data (called from loop polling).
-static void buildFilterModal(const String &authorsBody, const String &seriesBody) {
+static void buildFilterModal(const std::vector<AuthorInfo> &authors, const std::vector<SeriesInfo> &series, int total) {
     lv_label_set_text(statusLabel, "Ready");
-    if (!authorsBody.length() && !seriesBody.length()) return;
-
-    JsonDocument aDoc, sDoc;
-    bool aOk = authorsBody.length() && deserializeJson(aDoc, authorsBody) == DeserializationError::Ok;
-    bool sOk = seriesBody.length()  && deserializeJson(sDoc, seriesBody)  == DeserializationError::Ok;
 
     filterModal = lv_obj_create(lv_screen_active());
     lv_obj_set_size(filterModal, LCD_W, LCD_H);
@@ -1265,39 +1734,54 @@ static void buildFilterModal(const String &authorsBody, const String &seriesBody
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
 
-    int total = (aOk ? (int)(aDoc["total"] | 0) : 0);
     char allLabel[48];
     snprintf(allLabel, sizeof(allLabel), "All cards  (%d)", total);
     lv_obj_t *allBtn = lv_list_add_button(list, NULL, allLabel);
     char *emptyStr = strdup("");
-    lv_obj_add_event_cb(allBtn, onAuthorPick, LV_EVENT_CLICKED, emptyStr);
+    lv_obj_add_event_cb(allBtn, onSourcePick, LV_EVENT_CLICKED, emptyStr);
     lv_obj_add_event_cb(allBtn, freePickStr, LV_EVENT_DELETE, emptyStr);
 
-    if (sOk) {
-        JsonArray series = sDoc["series"].as<JsonArray>();
-        if (series.size()) lv_list_add_text(list, "Series");
-        for (JsonObject s : series) {
-            const char *name = s["name"] | "?";
-            int count = s["count"] | 0;
+    int creativeCount = 0;
+    int purchasedCount = 0;
+    for (const auto &c : libraryCards) {
+        if (isCreativeCard(c)) creativeCount++;
+        else purchasedCount++;
+    }
+
+    lv_list_add_text(list, "Type");
+    char creativeLabel[64];
+    snprintf(creativeLabel, sizeof(creativeLabel), "Creative  (%d)", creativeCount);
+    lv_obj_t *creativeBtn = lv_list_add_button(list, LV_SYMBOL_EDIT, creativeLabel);
+    char *creativeStr = strdup("creative");
+    lv_obj_add_event_cb(creativeBtn, onSourcePick, LV_EVENT_CLICKED, creativeStr);
+    lv_obj_add_event_cb(creativeBtn, freePickStr, LV_EVENT_DELETE, creativeStr);
+
+    char purchasedLabel[64];
+    snprintf(purchasedLabel, sizeof(purchasedLabel), "Purchased  (%d)", purchasedCount);
+    lv_obj_t *purchasedBtn = lv_list_add_button(list, LV_SYMBOL_AUDIO, purchasedLabel);
+    char *purchasedStr = strdup("purchased");
+    lv_obj_add_event_cb(purchasedBtn, onSourcePick, LV_EVENT_CLICKED, purchasedStr);
+    lv_obj_add_event_cb(purchasedBtn, freePickStr, LV_EVENT_DELETE, purchasedStr);
+
+    if (series.size()) {
+        lv_list_add_text(list, "Series");
+        for (const auto &s : series) {
             char row[112];
-            snprintf(row, sizeof(row), "%s  (%d)", name, count);
+            snprintf(row, sizeof(row), "%s  (%d)", s.name.c_str(), s.count);
             lv_obj_t *b = lv_list_add_button(list, NULL, row);
-            char *ns = strdup(name);
+            char *ns = strdup(s.name.c_str());
             lv_obj_add_event_cb(b, onSeriesPick, LV_EVENT_CLICKED, ns);
             lv_obj_add_event_cb(b, freePickStr, LV_EVENT_DELETE, ns);
         }
     }
 
-    if (aOk) {
-        JsonArray authors = aDoc["authors"].as<JsonArray>();
-        if (authors.size()) lv_list_add_text(list, "Authors");
-        for (JsonObject a : authors) {
-            const char *name = a["name"] | "?";
-            int count = a["count"] | 0;
+    if (authors.size()) {
+        lv_list_add_text(list, "Authors");
+        for (const auto &a : authors) {
             char row[96];
-            snprintf(row, sizeof(row), "%s  (%d)", name, count);
+            snprintf(row, sizeof(row), "%s  (%d)", a.name.c_str(), a.count);
             lv_obj_t *b = lv_list_add_button(list, NULL, row);
-            char *ns = strdup(name);
+            char *ns = strdup(a.name.c_str());
             lv_obj_add_event_cb(b, onAuthorPick, LV_EVENT_CLICKED, ns);
             lv_obj_add_event_cb(b, freePickStr, LV_EVENT_DELETE, ns);
         }
@@ -1331,7 +1815,7 @@ static void onSeriesCardPick(lv_event_t *e) {
     const char *id = (const char *)lv_event_get_user_data(e);
     if (!id || !id[0]) return;
     Serial.printf("[ui] play (series) %s\n", id);
-    netPost((String("/play/") + id).c_str());
+    playCardNow(String(id));
     dismissSeriesModal();
 }
 
@@ -1339,8 +1823,9 @@ static void onSeriesHeaderPick(lv_event_t *e) {
     const char *name = (const char *)lv_event_get_user_data(e);
     currentSeries = (name && name[0]) ? String(name) : String("");
     currentAuthor = "";
+    currentSource = "";
     dismissSeriesModal();
-    reloadManifest();
+    applyLocalLibraryView(0);
 }
 
 // ---------- Developer sheet ----------
@@ -1534,6 +2019,49 @@ static lv_obj_t *npPlayPauseLbl = nullptr;
 static bool npIsPlaying = false;
 static int npVolume = 50;
 
+static String titleForCardId(const String &id) {
+    for (const auto &c : libraryCards) {
+        if (c.id == id) return c.title;
+    }
+    for (uint16_t idx : visibleCardIdx) {
+        const CardMeta &c = libraryCards[idx];
+        if (c.id == id) return c.title;
+    }
+    return "";
+}
+
+static void updateNowPlayingBar() {
+    if (nowPlayingTitle.length()) {
+        if (nowPlayingLabel) lv_label_set_text_fmt(nowPlayingLabel, LV_SYMBOL_PLAY "  %s", nowPlayingTitle.c_str());
+    } else {
+        if (nowPlayingLabel) lv_label_set_text(nowPlayingLabel, LV_SYMBOL_AUDIO "  Tap for player status");
+    }
+
+    if (!nowPlayingImg) return;
+    lv_image_set_src(nowPlayingImg, NULL);
+    if (!nowPlayingId.length()) return;
+    xSemaphoreTake(coverCacheMtx, portMAX_DELAY);
+    auto it = coverCache.find(nowPlayingId);
+    if (it != coverCache.end() && it->second && it->second->data) {
+        lv_image_cache_drop(&it->second->dsc);
+        lv_image_set_src(nowPlayingImg, &it->second->dsc);
+    }
+    xSemaphoreGive(coverCacheMtx);
+}
+
+static void setNowPlaying(const String &id, const String &title) {
+    nowPlayingId = id;
+    nowPlayingTitle = title.length() ? title : titleForCardId(id);
+    npIsPlaying = true;
+    updateNowPlayingBar();
+}
+
+static void playCardNow(const String &id) {
+    if (!id.length()) return;
+    setNowPlaying(id, titleForCardId(id));
+    netPlayCard(id.c_str());
+}
+
 static void dismissNpModal() {
     if (npModal) { lv_obj_delete_async(npModal); npModal = nullptr; }
     npVolLbl = nullptr;
@@ -1545,13 +2073,13 @@ static void onNpClose(lv_event_t *) { dismissNpModal(); }
 
 static void onVolDown(lv_event_t *) {
     npVolume = max(0, npVolume - 10);
-    netPost((String("/volume/") + npVolume).c_str());
+    netSetVolume(npVolume);
     if (npVolLbl) lv_label_set_text_fmt(npVolLbl, "%d%%", npVolume);
 }
 
 static void onVolUp(lv_event_t *) {
     npVolume = min(100, npVolume + 10);
-    netPost((String("/volume/") + npVolume).c_str());
+    netSetVolume(npVolume);
     if (npVolLbl) lv_label_set_text_fmt(npVolLbl, "%d%%", npVolume);
 }
 
@@ -1568,18 +2096,21 @@ static void updatePlayPauseBtn() {
 
 static void onNpPlayPause(lv_event_t *) {
     if (npIsPlaying) {
-        netPost("/pause");
+        netPause();
         npIsPlaying = false;
     } else {
-        netPost("/resume");
+        netResume();
         npIsPlaying = true;
     }
     updatePlayPauseBtn();
 }
 
 static void onNpStop(lv_event_t *) {
-    netPost("/stop");
-    if (nowPlayingLabel) lv_label_set_text(nowPlayingLabel, LV_SYMBOL_AUDIO "  Tap for player status");
+    netStop();
+    nowPlayingId = "";
+    nowPlayingTitle = "";
+    npIsPlaying = false;
+    updateNowPlayingBar();
     dismissNpModal();
 }
 
@@ -1684,12 +2215,8 @@ static void openSeriesModal(lv_event_t *) {
 }
 
 // Build series modal from fetched data (called from loop polling).
-static void buildSeriesModal(const String &body) {
+static void buildSeriesModal(const std::vector<SeriesDetail> &series) {
     lv_label_set_text(statusLabel, "Ready");
-    if (!body.length()) return;
-
-    JsonDocument doc;
-    if (deserializeJson(doc, body) != DeserializationError::Ok) return;
 
     seriesModal = lv_obj_create(lv_screen_active());
     lv_obj_set_size(seriesModal, LCD_W, LCD_H);
@@ -1731,32 +2258,27 @@ static void buildSeriesModal(const String &body) {
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
 
-    JsonArray series = doc["series"].as<JsonArray>();
-    if (!series.size()) {
+    if (series.empty()) {
         lv_list_add_text(list, "No series detected");
         return;
     }
-    for (JsonObject s : series) {
-        const char *name = s["name"] | "?";
-        int count = s["count"] | 0;
+    for (const auto &s : series) {
         char hdrTxt[112];
-        snprintf(hdrTxt, sizeof(hdrTxt), "%s  (%d)", name, count);
+        snprintf(hdrTxt, sizeof(hdrTxt), "%s  (%d)", s.name.c_str(), s.count);
         lv_obj_t *h = lv_list_add_button(list, NULL, hdrTxt);
         lv_obj_set_style_bg_color(h, lv_color_hex(0x21262d), 0);
         lv_obj_set_style_text_color(h, lv_color_hex(0x58a6ff), 0);
         lv_obj_set_style_text_font(h, &lv_font_montserrat_16, 0);
-        char *ns = strdup(name);
+        char *ns = strdup(s.name.c_str());
         lv_obj_add_event_cb(h, onSeriesHeaderPick, LV_EVENT_CLICKED, ns);
         lv_obj_add_event_cb(h, freePickStr, LV_EVENT_DELETE, ns);
 
-        JsonArray cardsArr = s["cards"].as<JsonArray>();
-        for (JsonObject c : cardsArr) {
-            const char *cid = c["cardId"] | "";
-            const char *title = c["title"] | "?";
+        for (const auto &c : s.cards) {
             char row[128];
-            snprintf(row, sizeof(row), "  %s", title);
+            if (c.sequenceNumber > 0) snprintf(row, sizeof(row), "  #%d  %s", c.sequenceNumber, c.title.c_str());
+            else snprintf(row, sizeof(row), "  %s", c.title.c_str());
             lv_obj_t *b = lv_list_add_button(list, LV_SYMBOL_PLAY, row);
-            char *cidStr = strdup(cid);
+            char *cidStr = strdup(c.id.c_str());
             lv_obj_add_event_cb(b, onSeriesCardPick, LV_EVENT_CLICKED, cidStr);
             lv_obj_add_event_cb(b, freePickStr, LV_EVENT_DELETE, cidStr);
         }
@@ -1793,28 +2315,38 @@ static void buildScreen() {
     lv_obj_remove_flag(top, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_align(top, LV_ALIGN_TOP_MID, 0, 0);
 
-    lv_obj_t *title = lv_label_create(top);
-    lv_label_set_text(title, "Sophie's Yoto");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x58a6ff), 0);
-    lv_obj_align(title, LV_ALIGN_LEFT_MID, 20, 0);
-    lv_obj_add_flag(title, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x2ea043), LV_STATE_PRESSED);
-    lv_obj_add_event_cb(title, onHomeClick, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *homeBtn = lv_button_create(top);
+    lv_obj_set_size(homeBtn, 112, 44);
+    lv_obj_set_style_bg_color(homeBtn, lv_color_hex(0x21262d), 0);
+    lv_obj_set_style_radius(homeBtn, 8, 0);
+    lv_obj_align(homeBtn, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_obj_add_event_cb(homeBtn, onHomeClick, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *homeLbl = lv_label_create(homeBtn);
+    lv_label_set_text(homeLbl, LV_SYMBOL_HOME "  Home");
+    lv_obj_set_style_text_font(homeLbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(homeLbl);
 
-    // Series browser button — single primary nav action.
-    lv_obj_t *sb = lv_button_create(top);
-    lv_obj_set_size(sb, 160, 44);
-    lv_obj_set_style_bg_color(sb, lv_color_hex(0x30363d), 0);
-    lv_obj_set_style_radius(sb, 8, 0);
-    lv_obj_align(sb, LV_ALIGN_CENTER, 0, 0);
-    filterBtnLabel = lv_label_create(sb);  // re-used as the current-filter readout
-    lv_label_set_text(filterBtnLabel, LV_SYMBOL_LIST "  Series");
-    lv_label_set_long_mode(filterBtnLabel, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(filterBtnLabel, 140);
-    lv_obj_set_style_text_align(filterBtnLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(filterBtnLabel);
-    lv_obj_add_event_cb(sb, openSeriesModal, LV_EVENT_CLICKED, nullptr);
+    creativeTopBtn = lv_button_create(top);
+    lv_obj_set_size(creativeTopBtn, 132, 44);
+    lv_obj_set_style_bg_color(creativeTopBtn, lv_color_hex(0x30363d), 0);
+    lv_obj_set_style_radius(creativeTopBtn, 8, 0);
+    lv_obj_align(creativeTopBtn, LV_ALIGN_CENTER, -74, 0);
+    lv_obj_add_event_cb(creativeTopBtn, onCreativeTop, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *creativeLbl = lv_label_create(creativeTopBtn);
+    lv_label_set_text(creativeLbl, LV_SYMBOL_EDIT "  Creative");
+    lv_obj_set_style_text_font(creativeLbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(creativeLbl);
+
+    purchasedTopBtn = lv_button_create(top);
+    lv_obj_set_size(purchasedTopBtn, 142, 44);
+    lv_obj_set_style_bg_color(purchasedTopBtn, lv_color_hex(0x30363d), 0);
+    lv_obj_set_style_radius(purchasedTopBtn, 8, 0);
+    lv_obj_align(purchasedTopBtn, LV_ALIGN_CENTER, 72, 0);
+    lv_obj_add_event_cb(purchasedTopBtn, onPurchasedTop, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *purchasedLbl = lv_label_create(purchasedTopBtn);
+    lv_label_set_text(purchasedLbl, LV_SYMBOL_AUDIO "  Purchased");
+    lv_obj_set_style_text_font(purchasedLbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(purchasedLbl);
 
     statusLabel = lv_label_create(top);
     lv_label_set_text(statusLabel, "Connecting...");
@@ -1876,14 +2408,22 @@ static void buildScreen() {
     lv_obj_add_flag(nowPlayingBar, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(nowPlayingBar, onNowPlayingTap, LV_EVENT_CLICKED, nullptr);
 
+    nowPlayingImg = lv_image_create(nowPlayingBar);
+    lv_obj_set_size(nowPlayingImg, 32, 32);
+    lv_image_set_scale(nowPlayingImg, 57);
+    lv_obj_set_style_bg_color(nowPlayingImg, lv_color_hex(0x2a313a), 0);
+    lv_obj_set_style_bg_opa(nowPlayingImg, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(nowPlayingImg, 5, 0);
+    lv_obj_align(nowPlayingImg, LV_ALIGN_LEFT_MID, 18, 0);
+
     nowPlayingLabel = lv_label_create(nowPlayingBar);
     lv_label_set_text(nowPlayingLabel, LV_SYMBOL_AUDIO "  Tap for player status");
     lv_label_set_long_mode(nowPlayingLabel, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(nowPlayingLabel, LCD_W - 20);
-    lv_obj_set_style_text_align(nowPlayingLabel, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_center(nowPlayingLabel);
+    lv_obj_set_width(nowPlayingLabel, LCD_W - 80);
+    lv_obj_set_style_text_align(nowPlayingLabel, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_align(nowPlayingLabel, LV_ALIGN_LEFT_MID, 60, 0);
 
-    // Grid: top bar (60) + grid + reserved now-playing strip (40) + bottom bar (60) = LCD_H.
+    // Grid: pre-allocate slots
     grid = lv_obj_create(scr);
     lv_obj_set_size(grid, LCD_W, LCD_H - 60 - 40 - 60);
     lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 60);
@@ -1891,6 +2431,114 @@ static void buildScreen() {
     lv_obj_set_style_border_width(grid, 0, 0);
     lv_obj_set_style_pad_all(grid, 0, 0);
     lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+
+    int cellW = LCD_W / GRID_COLS;
+    int cellH = (LCD_H - 60 - 40 - 60) / GRID_ROWS;
+
+    for (int i = 0; i < PAGE_SIZE; i++) {
+        int col = i % GRID_COLS;
+        int row = i / GRID_COLS;
+
+        lv_obj_t *cont = lv_obj_create(grid);
+        lv_obj_set_size(cont, cellW - 16, cellH - 8);
+        lv_obj_set_pos(cont, col * cellW + 8, row * cellH + 4);
+        lv_obj_set_style_bg_color(cont, lv_color_hex(0x1c2128), 0);
+        lv_obj_set_style_border_width(cont, 1, 0);
+        lv_obj_set_style_border_color(cont, lv_color_hex(0x2d333b), 0);
+        lv_obj_set_style_radius(cont, 12, 0);
+        lv_obj_remove_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(cont, 2, 0);
+        lv_obj_set_style_border_color(cont, lv_color_hex(0x58a6ff), LV_STATE_PRESSED);
+
+        lv_obj_t *img = lv_image_create(cont);
+        lv_obj_set_size(img, THUMB_SIZE, THUMB_SIZE);
+        lv_obj_set_style_bg_color(img, lv_color_hex(0x2a313a), 0);
+        lv_obj_set_style_bg_opa(img, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(img, 8, 0);
+        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 0);
+
+        lv_obj_t *l = lv_label_create(cont);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+        lv_obj_set_size(l, THUMB_SIZE, 48);
+        lv_obj_set_style_bg_color(l, lv_color_hex(0x0a0a0a), 0);
+        lv_obj_set_style_bg_opa(l, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(l, lv_color_white(), 0);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_line_space(l, 1, 0);
+        lv_obj_set_style_pad_hor(l, 4, 0);
+        lv_obj_set_style_pad_ver(l, 2, 0);
+        lv_obj_set_style_radius(l, 0, 0);
+        lv_obj_align_to(l, img, LV_ALIGN_BOTTOM_MID, 0, 0);
+
+        lv_obj_t *badge = lv_label_create(cont);
+        lv_label_set_text(badge, "#1");
+        lv_obj_set_style_bg_color(badge, lv_color_hex(0x238636), 0);
+        lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(badge, lv_color_white(), 0);
+        lv_obj_set_style_text_font(badge, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_pad_hor(badge, 6, 0);
+        lv_obj_set_style_pad_ver(badge, 3, 0);
+        lv_obj_set_style_radius(badge, 8, 0);
+        lv_obj_align_to(badge, img, LV_ALIGN_TOP_RIGHT, -4, 4);
+        lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_add_flag(cont, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(cont, LV_OBJ_FLAG_HIDDEN);
+
+        // Click handler needs to know which slot was clicked
+        lv_obj_add_event_cb(cont, [](lv_event_t *e) {
+            lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+            int idx = -1;
+            for(int k=0; k<PAGE_SIZE; k++) if(lv_obj_get_child(grid, k) == obj) { idx = k; break; }
+            if(idx >= 0 && slotId[idx].length() > 0) {
+                const char* title = (const char*)lv_obj_get_user_data(obj);
+                openCardDetail(slotId[idx].c_str(), title);
+            }
+        }, LV_EVENT_CLICKED, nullptr);
+        lv_obj_add_event_cb(cont, [](lv_event_t *e) {
+            lv_obj_t *obj = (lv_obj_t *)lv_event_get_target(e);
+            int idx = -1;
+            for(int k=0; k<PAGE_SIZE; k++) if(lv_obj_get_child(grid, k) == obj) { idx = k; break; }
+            if(idx >= 0 && slotId[idx].length() > 0) {
+                playCardNow(slotId[idx]);
+                lv_label_set_text(statusLabel, "Playing");
+            }
+        }, LV_EVENT_LONG_PRESSED, nullptr);
+
+        // Cleanup user data on delete
+        lv_obj_add_event_cb(cont, [](lv_event_t *e) {
+            char *t = (char *)lv_obj_get_user_data((lv_obj_t *)lv_event_get_target(e));
+            if (t) free(t);
+        }, LV_EVENT_DELETE, nullptr);
+    }
+
+    bootSplash = lv_obj_create(scr);
+    lv_obj_set_size(bootSplash, LCD_W, LCD_H);
+    lv_obj_align(bootSplash, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(bootSplash, lv_color_hex(0x0d1117), 0);
+    lv_obj_set_style_bg_opa(bootSplash, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bootSplash, 0, 0);
+    lv_obj_set_style_radius(bootSplash, 0, 0);
+    lv_obj_remove_flag(bootSplash, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *brand = lv_label_create(bootSplash);
+    lv_label_set_text(brand, "Sophie's Yoto");
+    lv_obj_set_style_text_font(brand, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(brand, lv_color_hex(0x58a6ff), 0);
+    lv_obj_align(brand, LV_ALIGN_CENTER, 0, -58);
+
+    lv_obj_t *spinner = lv_spinner_create(bootSplash);
+    lv_obj_set_size(spinner, 48, 48);
+    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x30363d), 0);
+    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x58a6ff), LV_PART_INDICATOR);
+
+    bootSplashLabel = lv_label_create(bootSplash);
+    lv_label_set_text(bootSplashLabel, "Waking up...");
+    lv_obj_set_style_text_font(bootSplashLabel, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(bootSplashLabel, lv_color_hex(0xc9d1d9), 0);
+    lv_obj_align(bootSplashLabel, LV_ALIGN_CENTER, 0, 58);
 }
 
 // ---------- WiFi ----------
@@ -1904,44 +2552,123 @@ static void startWifi() {
 enum BootStage : uint8_t {
     BOOT_SD,           // mount SD + show cached manifest immediately (offline)
     BOOT_WIFI,         // waiting for WiFi (UI already interactive)
-    BOOT_FETCH,        // refresh manifest from server
+    BOOT_AUTH,         // Yoto auth (device code flow if needed)
+    BOOT_FETCH,        // refresh manifest from Yoto API
     BOOT_DONE,
 };
 static BootStage bootStage = BOOT_SD;
 static uint32_t bootStageEntered = 0;
+
+// Auth flow state
+static String authDeviceCode;
+static uint32_t authNextPoll = 0;
+static int authPollInterval = 5;
+static lv_obj_t *authOverlay = nullptr;   // full-screen auth panel
+static lv_obj_t *authCodeLabel = nullptr; // the big user_code text
+static lv_obj_t *authUrlLabel = nullptr;  // the URL text
+
+static void dismissAuthOverlay() {
+    if (authOverlay) { lv_obj_del(authOverlay); authOverlay = nullptr; authCodeLabel = nullptr; authUrlLabel = nullptr; }
+}
+
+static void showAuthOverlay(const String &userCode, const String &url) {
+    dismissAuthOverlay();
+    // Full-screen opaque dark panel
+    authOverlay = lv_obj_create(lv_scr_act());
+    lv_obj_set_size(authOverlay, LCD_W, LCD_H);
+    lv_obj_align(authOverlay, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(authOverlay, lv_color_hex(0x161b22), 0);
+    lv_obj_set_style_bg_opa(authOverlay, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(authOverlay, 0, 0);
+    lv_obj_set_style_radius(authOverlay, 0, 0);
+    lv_obj_set_style_pad_all(authOverlay, 20, 0);
+    lv_obj_set_flex_flow(authOverlay, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(authOverlay, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(authOverlay, 30, 0);
+
+    // --- Left side: QR code ---
+    // Build the full URL with user_code embedded so scanning goes straight to activation
+    String qrUrl = url;
+    if (qrUrl.indexOf('?') < 0) {
+        qrUrl += "?user_code=" + userCode;
+    }
+    lv_obj_t *qr = lv_qrcode_create(authOverlay);
+    lv_qrcode_set_size(qr, 200);
+    lv_qrcode_set_dark_color(qr, lv_color_hex(0x161b22));
+    lv_qrcode_set_light_color(qr, lv_color_white());
+    lv_qrcode_set_data(qr, qrUrl.c_str());
+
+    // --- Right side: text column ---
+    lv_obj_t *col = lv_obj_create(authOverlay);
+    lv_obj_set_size(col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(col, 0, 0);
+    lv_obj_set_style_pad_all(col, 0, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(col, 8, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(col);
+    lv_label_set_text(title, LV_SYMBOL_WIFI "  Yoto Login");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+
+    // Instructions
+    lv_obj_t *inst = lv_label_create(col);
+    lv_label_set_text(inst, "Scan the QR code, or visit:");
+    lv_obj_set_style_text_color(inst, lv_color_hex(0x8b949e), 0);
+
+    // URL
+    authUrlLabel = lv_label_create(col);
+    lv_label_set_text(authUrlLabel, url.c_str());
+    lv_obj_set_style_text_font(authUrlLabel, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(authUrlLabel, lv_color_hex(0x58a6ff), 0);
+
+    // "and enter code:"
+    lv_obj_t *inst2 = lv_label_create(col);
+    lv_label_set_text(inst2, "and enter this code:");
+    lv_obj_set_style_text_color(inst2, lv_color_hex(0x8b949e), 0);
+
+    // Big code
+    authCodeLabel = lv_label_create(col);
+    lv_label_set_text(authCodeLabel, userCode.c_str());
+    lv_obj_set_style_text_font(authCodeLabel, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(authCodeLabel, lv_color_hex(0x3fb950), 0);
+    lv_obj_set_style_text_letter_space(authCodeLabel, 10, 0);
+
+    // Waiting message
+    lv_obj_t *wait = lv_label_create(col);
+    lv_label_set_text(wait, "Waiting for authorization...");
+    lv_obj_set_style_text_color(wait, lv_color_hex(0x8b949e), 0);
+}
 
 static void enterStage(BootStage s) {
     bootStage = s;
     bootStageEntered = millis();
 }
 
+static bool loadCachedLibraryView(const char *statusText) {
+    String sig;
+    std::vector<CardMeta> cards;
+    if (!sdcache::loadManifest(sig, cards) || cards.empty()) return false;
+    libraryCards = std::move(cards);
+    int targetPage = restorePage;
+    restorePage = 0;
+    applyLibraryView(targetPage);
+    if (statusLabel) lv_label_set_text(statusLabel, statusText);
+    hideBootSplash();
+    Serial.printf("[boot] cached view heap=%u internal=%u psram=%u\n",
+        (unsigned)ESP.getFreeHeap(),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)ESP.getFreePsram());
+    return true;
+}
+
 static void tickBoot() {
     switch (bootStage) {
     case BOOT_SD: {
-        // Try the persisted manifest first so the user sees the library before
-        // WiFi even comes up. If SD has it, this is "instant boot" territory.
-        String sig;
-        std::vector<CardMeta> cards;
-        if (sdcache::loadManifest(sig, cards) && !cards.empty()) {
-            allCards = std::move(cards);
-            // Restore filter signature so /cards refresh matches and the label is correct.
-            int p1 = sig.indexOf('|');
-            int p2 = sig.indexOf('|', p1 + 1);
-            if (p1 > 0 && p2 > p1) {
-                currentSort   = sig.substring(0, p1);
-                currentAuthor = sig.substring(p1 + 1, p2);
-                currentSeries = sig.substring(p2 + 1);
-            }
-            if (filterBtnLabel) {
-                String fb;
-                if (currentSeries.length())      fb = String(LV_SYMBOL_LIST "  ") + currentSeries;
-                else if (currentAuthor.length()) fb = String(LV_SYMBOL_EDIT "  ") + currentAuthor;
-                else                              fb = String(LV_SYMBOL_LIST "  Series");
-                lv_label_set_text(filterBtnLabel, fb.c_str());
-            }
-            loadPage(0);                           // pulls covers from SD too
-            lv_label_set_text(statusLabel, "Offline cache");
-        }
+        setBootSplashText("Finding WiFi...");
         startWifi();
         enterStage(BOOT_WIFI);
         break;
@@ -1949,21 +2676,125 @@ static void tickBoot() {
     case BOOT_WIFI: {
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("[wifi] connected, IP=%s\n", WiFi.localIP().toString().c_str());
+            setBootSplashText("Signing in...");
+            // Disable WiFi power save — keeps PHY active so it doesn't
+            // need to re-init (and allocate timers) while TLS uses internal SRAM
+            esp_wifi_set_ps(WIFI_PS_NONE);
             // Start ElegantOTA web server — browse to http://<IP>/update
             ElegantOTA.begin(&otaServer);
             otaServer.begin();
             Serial.println("[ota] ElegantOTA ready at /update");
-            lv_label_set_text(statusLabel, allCards.empty() ? "Loading..." : "Refreshing...");
-            enterStage(BOOT_FETCH);
+            lv_label_set_text(statusLabel, "Authenticating...");
+            enterStage(BOOT_AUTH);
             return;
         }
         if (millis() - bootStageEntered > 30000) {
-            lv_label_set_text(statusLabel, allCards.empty() ? "WiFi failed" : "Offline");
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            setBootSplashText("Opening offline library...");
+            if (!loadCachedLibraryView("Offline cache")) {
+                lv_label_set_text(statusLabel, "WiFi failed");
+                setBootSplashText("WiFi failed");
+            }
             enterStage(BOOT_DONE);
         }
         break;
     }
+    case BOOT_AUTH: {
+        // If we already have a refresh token, skip auth
+        if (yotoAuthReady()) {
+            // Do an eager token refresh NOW (on the main core) while heap is
+            // still plentiful. The first TLS handshake allocates PHY timers
+            // and needs ~40KB free internal SRAM; doing it here avoids the
+            // OOM that would happen if the net task tried it after LVGL has
+            // loaded the full grid + cover cache.
+            Serial.printf("[auth] eager token refresh, heap=%u internal=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            bool tokenOk = yotoEnsureToken();
+            Serial.printf("[auth] after refresh, heap=%u internal=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+            if (!tokenOk) {
+                Serial.println("[auth] stored token refresh failed");
+                if (!yotoAuthReady()) {
+                    Serial.println("[auth] stored credentials rejected; starting login flow");
+                    authDeviceCode = "";
+                    dismissAuthOverlay();
+                } else {
+                    setBootSplashText("Opening offline library...");
+                    if (!loadCachedLibraryView("Offline cache")) {
+                        lv_label_set_text(statusLabel, "Auth refresh failed");
+                        setBootSplashText("Login unavailable");
+                    }
+                    enterStage(BOOT_DONE);
+                    return;
+                }
+            } else {
+                lv_label_set_text(statusLabel, visibleCardIdx.empty() ? "Loading..." : "Refreshing...");
+                setBootSplashText("Checking cards...");
+                dismissAuthOverlay();
+                enterStage(BOOT_FETCH);
+                return;
+            }
+        }
+
+        // Check for completed auth poll
+        if (netAuthReady) {
+            xSemaphoreTake(netAuthMtx, portMAX_DELAY);
+            String result = netAuthResult;
+            netAuthReady = false;
+            xSemaphoreGive(netAuthMtx);
+
+            if (result == "authorized") {
+                Serial.println("[auth] authorized!");
+                lv_label_set_text(statusLabel, visibleCardIdx.empty() ? "Loading..." : "Refreshing...");
+                setBootSplashText("Checking cards...");
+                dismissAuthOverlay();
+                enterStage(BOOT_FETCH);
+                return;
+            } else if (result == "expired" || result == "error") {
+                Serial.println("[auth] flow failed, restarting...");
+                authDeviceCode = "";
+                // Will restart flow below
+            }
+            // "pending" — keep polling
+        }
+
+        // Start device code flow if not started
+        if (!authDeviceCode.length()) {
+            DeviceCodeResult dcr = yotoStartDeviceFlow();
+            if (dcr.ok) {
+                authDeviceCode = dcr.deviceCode;
+                authPollInterval = dcr.interval;
+                authNextPoll = millis() + (uint32_t)authPollInterval * 1000;
+
+                // Show full-screen auth overlay with QR code
+                // Use verificationUriComplete if available (has user_code in URL)
+                String qrUrl = dcr.verificationUriComplete.length()
+                    ? dcr.verificationUriComplete
+                    : dcr.verificationUri;
+                showAuthOverlay(dcr.userCode, qrUrl);
+                lv_label_set_text(statusLabel, "Awaiting Yoto login...");
+                setBootSplashText("Waiting for login...");
+            } else {
+                lv_label_set_text(statusLabel, "Auth failed — retrying...");
+                setBootSplashText("Retrying login...");
+                enterStage(BOOT_AUTH);  // retry in next tick
+            }
+            return;
+        }
+
+        // Poll at interval
+        if (millis() >= authNextPoll) {
+            authNextPoll = millis() + (uint32_t)authPollInterval * 1000;
+            netAuthPoll(authDeviceCode.c_str());
+        }
+        break;
+    }
     case BOOT_FETCH: {
+        setBootSplashText("Loading library...");
         reloadManifest();  // non-blocking: enqueues to net task
         enterStage(BOOT_DONE);
         break;
@@ -1988,8 +2819,8 @@ void setup() {
     gfx->fillScreen(0x0000);
 
     Wire.begin(PIN_TOUCH_SDA, PIN_TOUCH_SCL);
-    ts.begin();
-    ts.setRotation(ROTATION_INVERTED);
+    Wire.setClock(400000);
+    touchInit();
 
     lv_init();
     void *fb = gfx->getFramebuffer();
@@ -2004,13 +2835,16 @@ void setup() {
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, touch_read);
 
+    loadUiState();
     buildScreen();
+    updateFilterButtonLabel();
     lv_label_set_text(statusLabel, "Mounting SD...");
     lv_timer_handler();
 
     sdcache::begin();
     loadBrightness();
     blSetDuty(BL_DUTY_ACTIVE);
+    yotoApiInit();
 
     lv_label_set_text(statusLabel, "Connecting...");
     lv_timer_handler();
@@ -2053,10 +2887,11 @@ void loop() {
     // Manifest result
     if (netManifestReady) {
         xSemaphoreTake(netManifestMtx, portMAX_DELAY);
-        String body = std::move(netManifestBody);
+        auto cards = std::move(netManifestCards);
+        bool ok = netManifestOk;
         netManifestReady = false;
         xSemaphoreGive(netManifestMtx);
-        processManifestResult(body);
+        processManifestResult(std::move(cards), ok);
     }
 
     // Page covers result — refresh visible tiles
@@ -2067,15 +2902,19 @@ void loop() {
         if (page == currentPage) {
             // Refresh tiles that now have covers
             int start = page * PAGE_SIZE;
-            int count = min((int)allCards.size() - start, PAGE_SIZE);
+            int count = min((int)visibleCardIdx.size() - start, PAGE_SIZE);
             for (int i = 0; i < count; i++) {
-                const String &id = allCards[start + i].id;
+                const String &id = visibleCardAt(start + i).id;
                 if (slotImg[i] && slotId[i] == id && isCovered(id)) {
-                    lv_image_set_src(slotImg[i], &coverCache[id]->dsc);
+                    const lv_image_dsc_t *src = &coverCache[id]->dsc;
+                    lv_image_cache_drop(src);
+                    lv_image_set_src(slotImg[i], NULL);
+                    lv_image_set_src(slotImg[i], src);
                     lv_obj_invalidate(slotImg[i]);
                 }
             }
             lv_label_set_text(statusLabel, "Ready");
+            updateNowPlayingBar();
         }
         // Handle queued page change
         if (pendingPage >= 0) {
@@ -2088,33 +2927,60 @@ void loop() {
     // Card detail extras result
     if (netDetailReady) {
         xSemaphoreTake(netDetailMtx, portMAX_DELAY);
-        String body = std::move(netDetailBody);
+        YotoCardDetail detail = std::move(netDetailResult);
         String id = std::move(netDetailId);
         netDetailReady = false;
         xSemaphoreGive(netDetailMtx);
         // Only process if the detail view is still showing the same card
         if (cardDetail && cardDetailId && id == String(cardDetailId)) {
-            processDetailResult(body);
+            processDetailResult(detail);
         }
+    }
+
+    // Larger cover for the currently open card detail view
+    if (netDetailCoverReady) {
+        xSemaphoreTake(netDetailCoverMtx, portMAX_DELAY);
+        String id = std::move(netDetailCoverId);
+        uint8_t *pixels = netDetailCoverPixels;
+        bool ok = netDetailCoverOk;
+        netDetailCoverPixels = nullptr;
+        netDetailCoverReady = false;
+        netDetailCoverOk = false;
+        xSemaphoreGive(netDetailCoverMtx);
+
+        if (ok) processDetailCoverResult(id, pixels);
+        else if (pixels) heap_caps_free(pixels);
     }
 
     // Filter modal data ready
     if (netFiltersReady) {
         xSemaphoreTake(netFiltersMtx, portMAX_DELAY);
-        String a = std::move(netAuthorsBody);
-        String s = std::move(netSeriesBody);
+        auto a = std::move(netAuthors);
+        auto s = std::move(netSeries);
+        int total = netTotalCards;
         netFiltersReady = false;
         xSemaphoreGive(netFiltersMtx);
-        if (!filterModal) buildFilterModal(a, s);
+        if (!filterModal) buildFilterModal(a, s, total);
     }
 
     // Series browser data ready
     if (netSeriesBrowseReady) {
         xSemaphoreTake(netSeriesBrowseMtx, portMAX_DELAY);
-        String body = std::move(netSeriesBrowseBody);
+        auto series = std::move(netSeriesBrowse);
         netSeriesBrowseReady = false;
         xSemaphoreGive(netSeriesBrowseMtx);
-        if (!seriesModal) buildSeriesModal(body);
+        if (!seriesModal) buildSeriesModal(series);
+    }
+
+    if (netCacheFillReady) {
+        int idx = netCacheFillIndex;
+        bool saved = netCacheFillSaved;
+        netCacheFillReady = false;
+        cacheFillInFlight = false;
+        cacheFillIndex = idx + 1;
+        if (saved && statusLabel && !loading) {
+            lv_label_set_text(statusLabel, "Caching covers...");
+        }
     }
 
     // Background prefetch (SD only — net prefetch uses the queue)
@@ -2122,6 +2988,12 @@ void loop() {
     if (!loading && millis() - lastPrefetch > 300) {
         lastPrefetch = millis();
         backgroundPrefetch();
+    }
+
+    static uint32_t lastCacheFill = 0;
+    if (bootStage == BOOT_DONE && !loading && millis() - lastCacheFill > 2000) {
+        lastCacheFill = millis();
+        backgroundCacheFill();
     }
 
     otaServer.handleClient();

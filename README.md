@@ -1,148 +1,146 @@
 # yoto-touch
 
-A kid-friendly touchscreen remote for the [Yoto Player](https://yotoplay.com).
-Built for a 7-year-old with ~200 cards who needs a tidy way to pick what to play
-without leaving cards strewn across her bedroom floor.
+A fully standalone kid-friendly touchscreen remote for the
+[Yoto Player](https://yotoplay.com). Built for a 7-year-old with ~200 cards
+who needs a tidy way to pick what to play without leaving cards strewn across
+her bedroom floor.
 
 ## Architecture
 
 ```
- ┌────────────────────────┐        HTTP          ┌──────────────────────────┐         HTTPS              ┌──────────────┐
- │ CrowPanel 7" ESP32-S3  │  ◀──────────────▶   │  Companion server        │  ◀────────────────────────▶ │  Yoto cloud  │
- │ MicroPython + LVGL     │   /cards /play ...  │  FastAPI (Python)        │   OAuth2 + REST            │ login.yoto.. │
- │ Touch UI for the kid   │                     │  caches library + art    │                            │ api.yoto..   │
- └────────────────────────┘                     └──────────────────────────┘                            └──────────────┘
+ ┌────────────────────────┐         HTTPS           ┌──────────────┐
+ │ CrowPanel 7" ESP32-S3  │  ◀─────────────────────▶│  Yoto cloud  │
+ │ Arduino + LVGL 9       │   OAuth2 device-flow    │ login.yoto.. │
+ │ Touch UI for the kid   │   REST API              │ api.yoto..   │
+ └────────────────────────┘                         └──────────────┘
 ```
 
-The companion server does the gnarly bits (OAuth2 device flow, token refresh,
-library caching, thumbnail resizing, REST commands to the player) so the
-firmware stays small: fetch JSON, draw a grid, send a play command.
+No companion server needed — the ESP32 talks directly to the Yoto API over
+TLS, handles OAuth2 device-code auth with on-screen QR code, caches the
+library manifest and cover thumbnails to microSD, and sends play/pause/volume
+commands straight to the player.
 
-Run the server on anything that's always on at home — Raspberry Pi, NAS,
-old laptop, or a Docker container on your desktop.
-
-Uses the official Yoto API documented at <https://yoto.dev/api/>, specifically:
+Uses the official Yoto API documented at <https://yoto.dev/api/>:
 
 - Device-flow auth: `POST https://login.yotoplay.com/oauth/device/code` + `/oauth/token`
-- Library: `GET /content/mine`, `GET /content/{cardId}`
-- Devices: `GET /device-v2/devices/mine`, `GET /device-v2/{id}/status`
+- Library: `GET /card/family/library` for purchased/shared cards, fallback
+  `GET /content/mine` for MYO cards, best-effort `GET /content/{cardId}` for
+  MYO detail enrichment
+- Devices: `GET /device-v2/devices/mine`
 - Commands: `POST /device-v2/{id}/command/card/start`, `card/pause`, `card/resume`,
-  `card/stop`, `volume/set`, `sleep-timer/set` (bodies mirror the MQTT payloads).
+  `card/stop`, `volume/set`
 
-## ⚠ Important caveat: official cards vs MYO
+## Hardware
 
-`GET /content/mine` only returns **MYO (Make Your Own)** cards — the ones you
-created in the Yoto app. **Commercial Yoto cards bought from the shop are not
-listed by any current public endpoint**.
+| Component | Details |
+| --------- | ------- |
+| Board | [Elecrow CrowPanel 7.0" HMI](https://www.elecrow.com/crowpanel-esp32-display.html) — ESP32-S3-N4R8 (4 MB flash, 8 MB octal PSRAM) |
+| Display | 800×480 RGB parallel panel, LVGL 9 direct-render mode |
+| Touch | GT911 capacitive, I2C |
+| Storage | microSD on HSPI (SPI mutex for thread safety) |
 
-The good news: once you know a commercial card's `cardId`, you can play it via
-`/device-v2/{id}/command/card/start` with `uri: https://yoto.io/<cardId>`.
+## Features
 
-Workarounds the server already supports:
+- **4×2 cover grid** — paginated library with 144×144 cover thumbnails
+- **On-device OAuth** — QR code displayed on screen, scan with phone to sign in
+- **Persistent auth** — tokens stored in NVS, auto-refresh
+- **SD cover cache** — covers saved as RGB565 to microSD, instant reload on boot
+- **SD manifest cache** — library metadata persisted to microSD, offline browsing
+- **PNG cover decode** — CDN covers resized via `?width=144&quality=70`,
+  decoded from PNG using pngle
+- **Player controls** — play, pause, resume, stop, volume
+- **Card detail view** — tap a card for description, chapter count, series info
+- **Filter & sort** — by author, series, title A-Z / Z-A
+- **Idle dimming** — backlight dims after 1 min, off after 5 min, wake on touch
+- **OTA updates** — ElegantOTA web server for firmware updates over WiFi
+- **Background prefetch** — adjacent pages pre-cached while idle
 
-- `server/data/extra_cards.json` — a local catalogue you can hand-curate. Each
-  entry needs at minimum `cardId` and `title`; optionally `metadata.cover.imageL`
-  for artwork. The library cache merges these in alongside MYO cards.
-- A simple "scan all my cards" workflow: hold each card to the player, watch
-  `GET /now-playing` for the resulting `activeCard` value, save it to
-  `extra_cards.json` with the title. Slow but one-off.
+## Official, Shared, And MYO Cards
 
-(Long-term: pre-built community catalogues of UK/US card IDs exist on GitHub —
-import one and you're done in seconds.)
+`GET /card/family/library` returns the family library catalogue, including
+purchased Yoto store cards (`shareType: "yoto"`), physically/digitally shared
+cards, and MYO cards. The firmware uses this as the primary catalogue source and
+parses only the fields needed for display and playback.
+
+`GET /content/{cardId}` is still used only as best-effort enrichment for MYO
+cards. It is not reliable for purchased store cards because those content
+objects are owned by Yoto, so store-card detail comes from the family-library
+response itself.
 
 ## Repo layout
 
-| Path        | What                                                                  |
-| ----------- | --------------------------------------------------------------------- |
-| `server/`   | FastAPI companion server (Python 3.11+)                               |
-| `firmware/` | MicroPython + LVGL firmware for the CrowPanel 7" (ESP32-S3 800×480)   |
+| Path | What |
+| ---- | ---- |
+| `firmware/arduino/` | PlatformIO project — Arduino + LVGL 9 firmware |
+| `firmware/arduino/src/main.cpp` | UI, net task, boot flow, grid rendering |
+| `firmware/arduino/src/yoto_api.cpp` | Yoto REST client — auth, library, covers, commands |
+| `firmware/arduino/src/sd_cache.cpp` | SD card cache — covers (RGB565) + manifest |
+| `firmware/arduino/include/pins.h` | CrowPanel 7" pin map |
+| `firmware/arduino/include/lv_conf.h` | LVGL 9 configuration |
 
-## Quick start (server)
+## Quick start
 
-1. Create a **public** client at <https://dashboard.yoto.dev/> and copy the
-   client ID.
-2. ```bash
-   cd server
-   python -m venv .venv && source .venv/bin/activate
-   pip install -e .
-   cp .env.example .env       # paste your YOTO_CLIENT_ID
-   uvicorn app.main:app --host 0.0.0.0 --port 8010
-   ```
-3. First run only — sign in:
-   ```bash
-   curl http://localhost:8010/auth/start
-   # → { "user_code": "ZDTT-NSTF",
-   #     "verification_uri_complete": "https://login.yotoplay.com/activate?user_code=ZDTT-NSTF", ... }
-   # open that URL on your phone and confirm.
-   curl http://localhost:8010/auth/poll      # repeat until {"status":"authorized"}
-   ```
-   Tokens are saved to `server/tokens/tokens.json` and refreshed automatically
-   forever after.
+### Prerequisites
 
-### Endpoints
+- [PlatformIO](https://platformio.org/) (CLI or VS Code extension)
+- An Elecrow CrowPanel 7.0" HMI (ESP32-S3-N4R8)
+- A Yoto API client ID from <https://dashboard.yoto.dev/> (create a "Public Client")
+- A microSD card (any size, FAT32 or exFAT)
 
-| Method | Path                          | Notes                                          |
-| ------ | ----------------------------- | ---------------------------------------------- |
-| GET    | `/auth/start`                 | begin device flow (returns user_code + URL)    |
-| GET    | `/auth/poll`                  | poll until authorised                          |
-| GET    | `/auth/status`                | `{ signed_in: bool }`                          |
-| GET    | `/cards?page=&size=&favourites_only=&folder=` | paged library                  |
-| GET    | `/cards/{id}`                 | full card detail incl. chapters                |
-| GET    | `/thumb/{id}`                 | 200×200 JPEG, cached on disk                   |
-| GET    | `/favourites`                 |                                                |
-| POST   | `/favourites/{id}`            | toggle                                         |
-| GET    | `/folders`                    | `{name: [cardId, ...]}`                        |
-| POST   | `/folders/{name}/{id}`        | add card to folder                             |
-| DELETE | `/folders/{name}/{id}`        |                                                |
-| GET    | `/devices`                    | players on the account                         |
-| GET    | `/now-playing`                | device status incl. active card                |
-| POST   | `/play/{id}`                  | play card on default (or `?device_id=`) player |
-| POST   | `/pause` `/resume` `/stop`    |                                                |
-| POST   | `/volume/{0..100}`            |                                                |
-| POST   | `/sleep-timer/{seconds}`      | 0 = cancel                                     |
-
-## Quick start (firmware)
-
-The CrowPanel 7" needs a MicroPython build that has LVGL + the RGB panel +
-GT911 touch driver compiled in. See [firmware/README.md](firmware/README.md)
-for the build / pre-built-image options and the `mpremote` flash recipe.
-
-Once the board boots into MicroPython:
+### Build & flash
 
 ```bash
-cd firmware
-cp config.py.example config.py    # edit WiFi creds + SERVER_URL
-mpremote cp -r . :/
-mpremote reset
+cd firmware/arduino
+
+# Create secrets file
+cp src/secrets.h.example src/secrets.h
+# Edit src/secrets.h — fill in WIFI_SSID, WIFI_PASSWORD, YOTO_CLIENT_ID
+
+# Build and upload
+pio run -t upload
+
+# Monitor serial
+pio device monitor -b 115200
 ```
 
-## Folders & favourites for kids
+### First run — sign in
 
-Two simple knobs to tame 200 cards:
+On first boot (or after clearing tokens), the screen shows a QR code and a
+user code. Scan the QR code with your phone, sign in with your Yoto account,
+and the device picks up the tokens automatically. Credentials are stored in
+NVS and refreshed forever after.
 
-- **Favourites** — single tap on a heart in the future UI extension; today
-  via `POST /favourites/{cardId}`. Shows on the "Favourites" page in the UI.
-- **Folders** — bedtime / music / stories / car / school. Edit
-  `server/data/folders.json` directly:
-  ```json
-  {
-    "Bedtime":  ["abc123", "def456"],
-    "Adventures": ["..."],
-    "Songs":    ["..."]
-  }
-  ```
+## How it works
 
-## Status
+1. **Boot** — mounts SD, connects WiFi, disables WiFi power-save (prevents
+   PHY timer crashes during TLS)
+2. **Auth** — checks NVS for saved tokens, refreshes if expired, starts
+   device-code flow if none
+3. **Library fetch** — pulls card list from Yoto API, saves manifest to SD
+4. **Cover fetch** — downloads PNG covers from Yoto CDN (resized server-side),
+   decodes to RGB565, caches to SD. Net task runs on core 0 to avoid blocking
+   LVGL on core 1
+5. **UI** — LVGL 9 grid with touch navigation. Tap a card to see details or
+   play it
 
-v1 scope: browse grid, tap to play, now-playing controls, favourites, folders.
-Not yet: sleep-timer UI, multi-player switching from the UI, MYO content upload,
-commercial-card auto-discovery.
+## Key technical details
+
+- **Dual-core split**: LVGL UI runs on core 1 (Arduino loop), all network I/O
+  on core 0 via a FreeRTOS task with a command queue
+- **SPI mutex**: SD card on HSPI is protected by a mutex since both cores access it
+- **Cover cache race safety**: `netFetchPageIntoCache` snapshots job pointers under
+  lock, re-validates before each write to handle concurrent eviction
+- **PSRAM routing**: all LVGL allocations go through a custom allocator into 8 MB
+  octal PSRAM (`lv_mem_psram.cpp`)
+- **WiFi PS disabled**: `esp_wifi_set_ps(WIFI_PS_NONE)` prevents PHY timer
+  allocation failures during TLS handshakes
 
 ## Security notes
 
-- Tokens live on the companion server only. The ESP32 never sees Yoto creds.
-- The companion server has **no authentication** in front of it. Don't expose
-  port 8010 to the public internet — keep it on your home LAN. If you must
-  expose it, put it behind a reverse proxy with basic auth or a Tailscale /
-  WireGuard tunnel.
-- Don't commit `.env`, `server/tokens/`, or `firmware/config.py`.
+- OAuth tokens are stored in ESP32 NVS (on-chip flash). No credentials are
+  transmitted in plaintext or stored on the SD card.
+- TLS is used for all API calls. Certificate validation is currently disabled
+  (`setInsecure()`) — a future improvement.
+- OTA update server is unauthenticated on the local network. Don't expose it
+  to the internet.
+- Don't commit `src/secrets.h`.
